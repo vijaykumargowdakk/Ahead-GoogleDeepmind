@@ -122,6 +122,31 @@ async function predict(context) {
   }
 }
 
+const expectedTimeSaved = networkRttMs => Math.max(0.1, networkRttMs / 1000)
+const dataPenalty = networkRttMs => (0.002 + 0.08 * Math.min(networkRttMs, 5000) / 3000) / 1024
+const signed = value => `${value >= 0 ? '+' : '−'}${Math.abs(value).toFixed(2)}`
+
+function adjudicate(input) {
+  const started = performance.now()
+  const proposals = Array.isArray(input.proposals) ? input.proposals : []
+  const metadata = new Map((Array.isArray(input.actionMetadata) ? input.actionMetadata : []).map(item => [item.actionId, item]))
+  const networkRttMs = Math.max(0, Number(input.context?.networkRttMs || 0))
+  const forcedActionId = input.forceConflict ? proposals[0]?.actionId : null
+  const rulings = proposals.map(proposal => {
+    const action = metadata.get(proposal.actionId)
+    const confidence = Math.max(0, Math.min(1, Number(proposal.confidence || 0)))
+    const bytesEstimate = Math.max(0, Number(action?.bytesEstimate || 0))
+    const adjustedValue = confidence * expectedTimeSaved(networkRttMs) - bytesEstimate * dataPenalty(networkRttMs)
+    const roundedValue = Number(adjustedValue.toFixed(3))
+    const size = `${Math.round(bytesEstimate / 1024)}KB`
+    if (proposal.actionId === forcedActionId) return { actionId: proposal.actionId, verdict: 'VETO', adjustedValue: roundedValue, rationale: 'forced conflict (demo)' }
+    if (!action?.speculatable) return { actionId: proposal.actionId, verdict: 'VETO', adjustedValue: roundedValue, rationale: `commit-only; ${size} on a ${networkRttMs}ms network, value ${signed(adjustedValue)}` }
+    const verdict = adjustedValue > 0 ? 'STAGE' : 'HOLD'
+    return { actionId: proposal.actionId, verdict, adjustedValue: roundedValue, rationale: `${size} on a ${networkRttMs}ms network, value ${signed(adjustedValue)} at ${Math.round(confidence * 100)}% confidence` }
+  })
+  return { rulings, adjudicatorLatencyMs: Math.max(1, Math.round(performance.now() - started)) }
+}
+
 const server = createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return json(res, 204, {})
   const url = new URL(req.url, 'http://127.0.0.1')
@@ -131,6 +156,7 @@ const server = createServer(async (req, res) => {
       return json(res, 200, { ok: true, ollama: !discovery.error, modelAvailable: Boolean(discovery.model), model: discovery.model, requestedModel, availableModels: discovery.models, ollamaUrl: OLLAMA, diagnostic: discovery.reason, mode: discovery.model ? 'local-model' : 'heuristic', modelTimeoutMs })
     }
     if (req.method === 'POST' && url.pathname === '/api/predict') return json(res, 200, await predict(await body(req)))
+    if (req.method === 'POST' && url.pathname === '/api/adjudicate') return json(res, 200, adjudicate(await body(req)))
     if (req.method === 'GET' && payloads[url.pathname]) {
       const network = url.searchParams.get('network') in delays ? url.searchParams.get('network') : 'congested'
       const speculative = url.searchParams.get('speculative') === '1'
