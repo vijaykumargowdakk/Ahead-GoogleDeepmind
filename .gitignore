@@ -1,0 +1,22 @@
+.DS_Store
+
+# Dependencies and generated builds
+node_modules/
+dist/
+app/node_modules/
+app/dist/
+
+# Local runtime logs and scratch output
+*.log
+work/
+outputs/
+app/server/index 2.mjs
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# OS/editor noise
+.idea/
+.vscode/
