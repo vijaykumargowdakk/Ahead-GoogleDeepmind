@@ -33,7 +33,12 @@ export class HeuristicPredictor implements Predictor {
 }
 
 export class GemmaPredictor implements Predictor {
-  constructor(private fallback: Predictor, private endpoint = 'http://localhost:11434/api/chat') {}
+  private fallback: Predictor
+  private endpoint: string
+  constructor(fallback: Predictor, endpoint = 'http://localhost:11434/api/chat') {
+    this.fallback = fallback
+    this.endpoint = endpoint
+  }
   async predict(context: PredictContext): Promise<Prediction> {
     const started = performance.now()
     const controller = new AbortController()
@@ -64,4 +69,26 @@ export class ShadowRuntime<T> {
   }
   commit(branchId: string): T | undefined { const branch = this.branches.get(branchId); this.branches.delete(branchId); return branch?.staged }
   rollback(branchId: string): boolean { const branch = this.branches.get(branchId); if (!branch) return false; branch.controller.abort(); this.branches.delete(branchId); return true }
+}
+
+export type RuntimeBranchState = 'idle' | 'speculating' | 'ready' | 'committed' | 'rolledback'
+
+export type TapResolution = 'baseline' | 'join' | 'commit' | 'rollback'
+
+export function resolveTap(input: {
+  ahead: boolean
+  actionId: string
+  branchActionId: string
+  branchState: RuntimeBranchState
+  shadowReady: boolean
+}): TapResolution {
+  if (!input.ahead || input.branchState === 'idle') return 'baseline'
+  if (input.actionId !== input.branchActionId) return 'rollback'
+  if (input.branchState === 'ready' && input.shadowReady) return 'commit'
+  if (input.branchState === 'speculating') return 'join'
+  return 'baseline'
+}
+
+export function measuredSavings(stagedMs: number, commitMs: number) {
+  return Math.max(0, Math.round(stagedMs) - Math.round(commitMs))
 }

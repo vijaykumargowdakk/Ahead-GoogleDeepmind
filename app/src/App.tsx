@@ -1,15 +1,16 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import './index.css'
+import { measuredSavings, resolveTap } from './runtime'
 
 type Network = 'good' | 'congested' | 'terrible'
 type ScenarioId = 'lunch' | 'dinner' | 'payday' | 'monthEnd' | 'billDue'
 type Screen = 'home' | 'food' | 'biryani' | 'pasta' | 'banking' | 'investments' | 'balance' | 'transfer' | 'utilities' | 'electricity' | 'water' | 'summary' | 'receipt'
-type BranchState = 'idle' | 'speculating' | 'committed' | 'rolledback'
+type BranchState = 'idle' | 'speculating' | 'ready' | 'committed' | 'rolledback'
 type EventType = 'prediction_made' | 'speculation_started' | 'image_preloaded' | 'shadow_hydrated' | 'branch_committed' | 'branch_rolled_back' | 'boundary_blocked'
 type Action = { id: string; label: string; screen: Screen; speculatable: boolean; icon: string; apiPath?: string; subtitle: string; appTint?: string }
 type Ranked = { actionId: string; confidence: number }
 type Telemetry = { type: EventType; detail: string; time: string }
-type ShadowPayload = { branchId: string; actionId: string; path: string; ready: boolean; payload: Record<string, unknown>; latencyMs: number; imageUrl?: string }
+type ShadowPayload = { branchId: string; actionId: string; path: string; ready: boolean; payload: Record<string, unknown>; latencyMs: number; bytes: number; imageUrl?: string }
 type Inspector = { systemPrompt: string; userPrompt: string; context: Record<string, unknown>; raw: string; fallbackReason?: string }
 
 const scenarios: Record<ScenarioId, { label: string; hour: number; day: number; signal: string; targets: Partial<Record<Screen, string>> }> = {
@@ -123,26 +124,41 @@ export default function App() {
   const [shadow, setShadow] = useState<ShadowPayload | null>(null)
   const [events, setEvents] = useState<Telemetry[]>([])
   const [saved, setSaved] = useState(0)
+  const [wastedBytes, setWastedBytes] = useState(0)
   const [hits, setHits] = useState(0)
   const [misses, setMisses] = useState(0)
   const [loading, setLoading] = useState(false)
+  const [flash, setFlash] = useState<'commit' | 'rollback' | null>(null)
+  const [resetSeq, setResetSeq] = useState(0)
   const [race, setRace] = useState({ normalMs: latency.terrible, shadowMs: 0, status: 'standby' })
   const [inspector, setInspector] = useState<Inspector>({ systemPrompt, userPrompt: 'Waiting for prediction...', context: {}, raw: 'pending' })
   const timer = useRef<ReturnType<typeof window.setTimeout> | undefined>(undefined)
   const branchId = useRef(0)
   const speculativeRequest = useRef<AbortController | null>(null)
+  const shadowRef = useRef<ShadowPayload | null>(null)
+  const branchRef = useRef(branch)
+  const stagingPromise = useRef<Promise<ShadowPayload | null> | null>(null)
 
   const actions = graph[screen]
   const predictedId = prediction[0]?.actionId
   const predictedAction = actions.find(action => action.id === predictedId)
-  const score = hits + misses ? Math.round((hits / (hits + misses)) * 100) : 100
+  const score = hits + misses ? `${Math.round((hits / (hits + misses)) * 100)}%` : '—'
   const hero = screenHero(screen, scenario, shadow)
 
   const log = (type: EventType, detail: string) => setEvents(previous => [{ type, detail, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }, ...previous].slice(0, 8))
+  const updateBranch = (next: { id: string; actionId: string; state: BranchState }) => { branchRef.current = next; setBranch(next) }
+  const updateShadow = (next: ShadowPayload | null) => { shadowRef.current = next; setShadow(next) }
+  const pulse = (kind: 'commit' | 'rollback') => {
+    setFlash(kind)
+    window.setTimeout(() => setFlash(null), 420)
+  }
 
   useEffect(() => {
     window.clearTimeout(timer.current)
     speculativeRequest.current?.abort()
+    stagingPromise.current = null
+    updateShadow(null)
+    updateBranch({ id: 'B-000', actionId: 'none', state: 'idle' })
     let cancelled = false
     const run = async () => {
       const config = scenarios[scenario]
@@ -185,40 +201,66 @@ export default function App() {
       const path = action.apiPath || '/api/apps/home'
       const controller = new AbortController()
       speculativeRequest.current = controller
-      setBranch({ id, actionId: chosen.actionId, state: 'speculating' })
-      setShadow({ branchId: id, actionId: chosen.actionId, path, ready: false, payload: { status: 'fetching' }, latencyMs: 0 })
+      updateBranch({ id, actionId: chosen.actionId, state: 'speculating' })
+      updateShadow({ branchId: id, actionId: chosen.actionId, path, ready: false, payload: { status: 'fetching' }, latencyMs: 0, bytes: 0 })
       log('prediction_made', `${model} ranked ${chosen.actionId} at ${Math.round(chosen.confidence * 100)}%`)
       log('speculation_started', `${id} started JSON + media preload for ${path}`)
       const started = performance.now()
-      fetch(`${path}?network=${network}`, { signal: controller.signal })
-        .then(response => response.json())
-        .then((payload: Record<string, unknown>) => {
-          if (cancelled) return
-          const took = Math.round(performance.now() - started)
+      const stage = async () => {
+        try {
+          const response = await fetch(`${path}?network=${network}`, { signal: controller.signal, headers: { 'X-Speculative': '1', 'X-AHEAD-Branch': id } })
+          if (!response.ok) throw new Error(`shadow request ${response.status}`)
+          const payload = await response.json() as Record<string, unknown>
           const imageUrl = typeof payload.imageUrl === 'string' ? payload.imageUrl : undefined
           if (imageUrl) {
             const image = new Image()
             image.src = imageUrl
-            log('image_preloaded', `${id} decoded ${imageUrl}`)
+            await image.decode()
+            if (controller.signal.aborted) return null
+            log('image_preloaded', `${id} decoded ${imageUrl} separately from JSON`)
           }
-          setShadow({ branchId: id, actionId: chosen.actionId, path, ready: true, payload, latencyMs: took, imageUrl })
-          log('shadow_hydrated', `${id} payload ready in ${took}ms`)
-        })
-        .catch(() => undefined)
+          if (cancelled || controller.signal.aborted) return null
+          const took = Math.round(performance.now() - started)
+          const jsonBytes = new Blob([JSON.stringify(payload)]).size
+          const bytes = jsonBytes + (typeof payload.bytes === 'number' ? payload.bytes : 0)
+          const hydrated = { branchId: id, actionId: chosen.actionId, path, ready: true, payload, latencyMs: took, bytes, imageUrl }
+          updateShadow(hydrated)
+          updateBranch({ id, actionId: chosen.actionId, state: 'ready' })
+          log('shadow_hydrated', `${id} ready: ${bytes.toLocaleString()} bytes staged in ${took}ms`)
+          return hydrated
+        } catch (error) {
+          if (!controller.signal.aborted && !cancelled) log('branch_rolled_back', `${id} staging failed: ${error instanceof Error ? error.message : 'unknown error'}`)
+          return null
+        }
+      }
+      stagingPromise.current = stage()
     }
     run()
     return () => { cancelled = true; speculativeRequest.current?.abort(); window.clearTimeout(timer.current) }
-  }, [screen, scenario, network, ahead, forceWrong])
+  }, [screen, scenario, network, ahead, forceWrong, resetSeq])
 
   const chooseScenario = (next: ScenarioId) => {
     setScenario(next)
     setScreen('home')
-    setShadow(null)
-    setBranch({ id: 'B-000', actionId: 'none', state: 'idle' })
+    updateShadow(null)
+    updateBranch({ id: 'B-000', actionId: 'none', state: 'idle' })
     setRace({ normalMs: latency[network], shadowMs: 0, status: 'scenario_reset' })
   }
 
-  const navigate = (action: Action) => {
+  const commitBranch = (action: Action, staged: ShadowPayload) => {
+    const commitMs = staged.imageUrl ? 12 : 18
+    const avoided = measuredSavings(staged.latencyMs, commitMs)
+    setRace({ normalMs: staged.latencyMs, shadowMs: commitMs, status: staged.imageUrl ? 'image_shadow_commit_won' : 'shadow_commit_won' })
+    updateBranch({ id: staged.branchId, actionId: staged.actionId, state: 'committed' })
+    setHits(value => value + 1)
+    setSaved(value => value + avoided)
+    log('branch_committed', `${staged.branchId} atomic commit in ${commitMs}ms; ${(avoided / 1000).toFixed(1)}s avoided; zero new fetches`)
+    pulse('commit')
+    setLoading(false)
+    setScreen(action.screen)
+  }
+
+  const navigate = async (action: Action) => {
     if (!action.speculatable) {
       log('boundary_blocked', 'COMMIT_ONLY: irreversible payment/transfer needs a human tap')
       setLoading(true)
@@ -226,39 +268,62 @@ export default function App() {
         .finally(() => { timer.current = window.setTimeout(() => { setLoading(false); setScreen(action.screen) }, 420) })
       return
     }
-    const hit = ahead && action.id === predictedId && branch.state === 'speculating' && shadow?.ready
-    if (hit) {
-      setRace({ normalMs: latency[network], shadowMs: shadow.imageUrl ? 12 : 18, status: shadow.imageUrl ? 'image_shadow_commit_won' : 'shadow_commit_won' })
-      setBranch(current => ({ ...current, state: 'committed' }))
-      setHits(value => value + 1)
-      setSaved(value => value + latency[network])
-      log('branch_committed', `${branch.id} promoted instantly; ${latency[network]}ms avoided`)
-      setScreen(action.screen)
-      return
+    const active = branchRef.current
+    const resolution = resolveTap({ ahead, actionId: action.id, branchActionId: active.actionId, branchState: active.state, shadowReady: Boolean(shadowRef.current?.ready) })
+    if (resolution === 'commit' || resolution === 'join') {
+      let staged = shadowRef.current?.ready ? shadowRef.current : null
+      if (!staged && stagingPromise.current) {
+        setLoading(true)
+        setRace({ normalMs: latency[network], shadowMs: 0, status: 'joining_inflight_shadow' })
+        staged = await stagingPromise.current
+      }
+      if (staged?.ready && staged.actionId === action.id) {
+        commitBranch(action, staged)
+        return
+      }
     }
-    if (ahead) {
-      setBranch(current => ({ ...current, state: 'rolledback' }))
+    const activeShadow = shadowRef.current
+    if (resolution === 'rollback') {
+      speculativeRequest.current?.abort('user_chose_different_branch')
+      const wasted = activeShadow?.bytes ?? 0
+      setWastedBytes(value => value + wasted)
+      updateBranch({ ...active, state: 'rolledback' })
       setMisses(value => value + 1)
-      log('branch_rolled_back', `${branch.id} discarded safely; no side effects crossed`)
+      log('branch_rolled_back', `${active.id} canceled immediately · 1 request aborted · ${wasted.toLocaleString()} bytes discarded · 0 side effects`)
+      pulse('rollback')
     }
     setRace({ normalMs: latency[network], shadowMs: 0, status: 'normal_network_wait' })
     setLoading(true)
-    timer.current = window.setTimeout(() => { setLoading(false); setScreen(action.screen) }, latency[network])
+    try {
+      if (action.apiPath) await fetch(`${action.apiPath}?network=${network}`, { headers: { 'X-AHEAD-Baseline': '1' } }).then(response => response.json())
+    } finally {
+      setLoading(false)
+      setScreen(action.screen)
+    }
+  }
+
+  const resetSession = () => {
+    speculativeRequest.current?.abort('session_reset')
+    window.clearTimeout(timer.current)
+    setScreen('home'); setSaved(0); setWastedBytes(0); setHits(0); setMisses(0); setEvents([]); setLoading(false); setFlash(null)
+    updateShadow(null); updateBranch({ id: 'B-000', actionId: 'none', state: 'idle' })
+    setRace({ normalMs: latency[network], shadowMs: 0, status: 'session_reset' })
+    setResetSeq(value => value + 1)
   }
 
   const edges = useMemo(() => Object.entries(graph).flatMap(([from, items]) => items.map(item => ({ from: from as Screen, to: item.screen, id: item.id }))).filter(edge => nodePos[edge.from] && nodePos[edge.to]), [])
 
   return <main>
-    <header><div className="brand"><span>A</span><div>AHEAD <em>V3 GEMMA SPECULATIVE ENGINE</em></div></div><div className="offline">IOS HOME · DEEP BRANCHES · IMAGE PRELOAD</div></header>
+    <header><div className="brand"><span>A</span><div>AHEAD <em>V4 GEMMA SPECULATIVE ENGINE</em></div></div><div className="offline">LOCAL FIRST · SHADOW STATE · ZERO SIDE EFFECTS</div></header>
     <section className="layout">
-      <article className="phone">
+      <article className={`phone ${flash ? `flash-${flash}` : ''}`}>
         <div className="notch" /><div className="phone-top"><small>9:41</small><b>● ● ●</b></div>
         <div className="app-head"><span className="avatar">P</span><div><small>{scenarios[scenario].label}</small><h2>{title[screen]}</h2></div><span className="scan">⌁</span></div>
         {loading ? <div className="phone-content"><div className="skeleton-screen"><i /><b /><b /><b /><span /></div></div> : <div className="phone-content scroll">
           <div className={hero.imageUrl ? 'hero-card media' : 'hero-card'}>{hero.imageUrl && <img src={hero.imageUrl} alt="" />}<small>{hero.eyebrow}</small><strong>{hero.value}</strong><p>{hero.copy}</p></div>
-          {screen === 'home' ? <div className="ios-grid">{actions.map(action => <button className={action.id === predictedId && branch.state === 'speculating' ? 'app-icon preloaded' : 'app-icon'} key={action.id} onClick={() => navigate(action)} style={{ '--tint': action.appTint } as CSSProperties}><span>{action.icon}</span><b>{action.label}</b>{action.id === predictedId && branch.state === 'speculating' && <em>{shadow?.ready ? 'PRELOADED' : 'STAGING'}</em>}</button>)}</div> : <>
+          {screen === 'home' ? <div className="ios-grid">{actions.map(action => <button className={action.id === predictedId && (branch.state === 'speculating' || branch.state === 'ready') ? 'app-icon preloaded' : 'app-icon'} key={action.id} onClick={() => navigate(action)} style={{ '--tint': action.appTint } as CSSProperties}><span>{action.icon}</span><b>{action.label}</b>{action.id === predictedId && (branch.state === 'speculating' || branch.state === 'ready') && <em>{branch.state === 'ready' ? 'PRELOADED' : 'STAGING'}</em>}</button>)}</div> : <>
             <p className="section-label">NEXT INSIDE {title[screen].toUpperCase()}</p>
-            {actions.map(action => <button className={action.id === predictedId && branch.state === 'speculating' ? 'service preloaded' : 'service'} key={action.id} onClick={() => navigate(action)}><span className="service-icon">{action.icon}</span><span>{action.label}<small>{action.subtitle}</small></span>{action.id === predictedId && branch.state === 'speculating' && <em>{shadow?.ready ? 'PRELOADED' : 'STAGING'}</em>}<b>›</b></button>)}
+            {actions.map(action => <button className={action.id === predictedId && (branch.state === 'speculating' || branch.state === 'ready') ? 'service preloaded' : 'service'} key={action.id} onClick={() => navigate(action)}><span className="service-icon">{action.icon}</span><span>{action.label}<small>{action.subtitle}</small></span>{action.id === predictedId && (branch.state === 'speculating' || branch.state === 'ready') && <em>{branch.state === 'ready' ? 'PRELOADED' : 'STAGING'}</em>}<b>›</b></button>)}
           </>}
           {screen === 'summary' && <p className="boundary">AHEAD can preload the review screen, but payment and transfer confirmation are commit-only.</p>}
         </div>}
@@ -266,14 +331,14 @@ export default function App() {
       </article>
 
       <aside className="dash">
-        <div className="eyebrow">V3 X-RAY ENGINE ROOM</div>
-        <div className="headline"><h1>Deep intent prediction <span>{(saved / 1000).toFixed(1)}s saved</span></h1><p>Gemma predicts app launch, then predicts inside the app. AHEAD preloads JSON and rich media into shadow memory before the user taps.</p></div>
-        <div className="grid stats"><div><small>PREDICTOR</small><b>{predictor.source === 'gemma4' ? 'Gemma 4' : predictor.source === 'gemma3' ? 'Gemma 3' : 'Heuristic'}</b><em>{predictor.model} · {predictor.latencyMs}ms</em></div><div><small>NETWORK</small><b>{latency[network]}ms</b><em className={network}>● {network.toUpperCase()}</em></div><div><small>ACCURACY</small><b>{score}%</b><em>{hits} commits · {misses} rollbacks</em></div></div>
-        <section className="panel graph-panel"><div className="panel-title"><span>DECISION GRAPH</span><small>{branch.state.toUpperCase()} · {branch.id}</small></div><svg viewBox="0 0 680 250">{edges.map(edge => { const from = nodePos[edge.from]!; const to = nodePos[edge.to]!; return <line key={`${edge.from}-${edge.id}`} x1={from.x} y1={from.y} x2={to.x} y2={to.y} className={edge.id === predictedId ? 'edge active' : 'edge'} /> })}{Object.entries(nodePos).map(([id, pos]) => <g key={id} className={screen === id ? 'node current' : predictedAction?.screen === id ? 'node predicted' : 'node'}><circle cx={pos.x} cy={pos.y} r="14" /><text x={pos.x} y={pos.y + 31}>{id}</text></g>)}</svg></section>
+        <div className="eyebrow">V4 X-RAY ENGINE ROOM</div>
+        <div className="headline"><h1>Speculation made visible <span>{(saved / 1000).toFixed(1)}s saved</span><small>{hits} commits · {misses} rollbacks · {(saved / 1000).toFixed(1)}s saved · {(wastedBytes / 1024).toFixed(1)}KB discarded</small></h1><p>Gemma ranks only legal next actions. AHEAD hydrates isolated shadow memory, commits matching human intent, and cancels every miss with zero side effects.</p></div>
+        <div className="grid stats"><div><small>PREDICTOR</small><b>{predictor.source === 'gemma4' ? 'Gemma 4' : predictor.source === 'gemma3' ? 'Gemma 3' : 'Heuristic tier'}</b><em>{predictor.model} · {predictor.latencyMs}ms</em></div><div><small>NETWORK</small><b>{latency[network]}ms</b><em className={network}>● {network.toUpperCase()}</em></div><div><small>ACCURACY</small><b>{score}</b><em>{hits} commits · {misses} rollbacks</em></div></div>
+        <section className="panel graph-panel"><div className="panel-title"><span>DECISION GRAPH</span><small>{branch.state.toUpperCase()} · {branch.id}</small></div><svg viewBox="0 0 680 250">{edges.map(edge => { const from = nodePos[edge.from]!; const to = nodePos[edge.to]!; const active = edge.from === screen && edge.id === predictedId; return <g key={`${edge.from}-${edge.id}`}><line x1={from.x} y1={from.y} x2={to.x} y2={to.y} className={active ? 'edge active' : 'edge'} />{active && <text className="edge-confidence" x={(from.x + to.x) / 2} y={(from.y + to.y) / 2 - 8}>{Math.round((prediction[0]?.confidence ?? 0) * 100)}%</text>}</g> })}{Object.entries(nodePos).map(([id, pos]) => <g key={id} className={screen === id ? 'node current' : predictedAction?.screen === id ? 'node predicted' : 'node'}><circle cx={pos.x} cy={pos.y} r="14" /><text x={pos.x} y={pos.y + 31}>{id}</text></g>)}</svg></section>
         <div className="split"><section className="panel"><div className="panel-title"><span>GEMMA RANKING</span><small>{screen.toUpperCase()}</small></div>{prediction.map(item => <div className="prediction" key={item.actionId}><div><b>{actions.find(action => action.id === item.actionId)?.label || item.actionId}</b><span>{Math.round(item.confidence * 100)}%</span></div><i><u style={{ width: `${item.confidence * 100}%` }} /></i></div>)}</section><section className="panel race"><div className="panel-title"><span>LATENCY RACE</span><small>{race.status}</small></div><div><span>Normal request</span><i><u style={{ width: `${Math.min(100, latency[network] / 30)}%` }} /></i><b>{race.normalMs}ms</b></div><div><span>Shadow commit</span><i><u className="fast" style={{ width: `${race.status.includes('won') ? 8 : 0}%` }} /></i><b>{race.status.includes('won') ? `${race.shadowMs}ms` : 'ready'}</b></div></section></div>
         <div className="split"><section className="panel json-panel"><div className="panel-title"><span>SHADOW MEMORY</span><small>{shadow?.imageUrl ? 'IMAGE + JSON' : shadow?.ready ? 'JSON' : 'WAITING'}</small></div><pre>{JSON.stringify(shadow || { state: 'no shadow branch yet' }, null, 2)}</pre></section><section className="panel json-panel"><div className="panel-title"><span>OLLAMA PIPELINE</span><small>{scenario}</small></div><pre>{JSON.stringify({ user: inspector.userPrompt, raw: inspector.raw, fallbackReason: inspector.fallbackReason }, null, 2)}</pre></section></div>
         <section className="panel events"><div className="panel-title"><span>EVENT STREAM</span><small>{scenarios[scenario].signal}</small></div>{events.length ? events.map((event, index) => <p key={`${event.time}-${index}`}><time>{event.time}</time><b>{event.type}</b>{event.detail}</p>) : <p>Runtime standing by...</p>}</section>
-        <section className="controls"><label><input type="checkbox" checked={ahead} onChange={event => setAhead(event.target.checked)} /><span>AHEAD {ahead ? 'ON' : 'OFF'}</span></label><select value={scenario} onChange={event => chooseScenario(event.target.value as ScenarioId)}>{Object.entries(scenarios).map(([id, item]) => <option key={id} value={id}>{item.label}</option>)}</select><select value={network} onChange={event => setNetwork(event.target.value as Network)}><option value="good">Good · 250ms</option><option value="congested">Congested · 1.4s</option><option value="terrible">Terrible · 3s</option></select><button onClick={() => setForceWrong(value => !value)} className={forceWrong ? 'wrong active' : 'wrong'}>Force wrong branch</button></section>
+        <section className="controls"><label><input type="checkbox" checked={ahead} onChange={event => setAhead(event.target.checked)} /><span>AHEAD {ahead ? 'ON' : 'OFF'}</span></label><select value={scenario} onChange={event => chooseScenario(event.target.value as ScenarioId)}>{Object.entries(scenarios).map(([id, item]) => <option key={id} value={id}>{item.label}</option>)}</select><select value={network} onChange={event => setNetwork(event.target.value as Network)}><option value="good">Good · 250ms</option><option value="congested">Congested · 1.4s</option><option value="terrible">Terrible · 3s</option></select><button onClick={() => setForceWrong(value => !value)} className={forceWrong ? 'wrong active' : 'wrong'}>Force wrong branch</button><button onClick={resetSession}>Reset session</button></section>
       </aside>
     </section>
   </main>

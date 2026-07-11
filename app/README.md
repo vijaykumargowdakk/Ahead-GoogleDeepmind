@@ -14,12 +14,15 @@ npm run dev:api
 npm run dev
 ```
 
-Open the local Vite URL. The demo deliberately starts on a **Terrible (5s)** network.
+Open the local Vite URL. The demo deliberately starts on a deterministic **Terrible (3s)** network.
 
-1. With AHEAD off, tap **Electricity** and observe baseline latency.
-2. Turn AHEAD on and return home. Electricity is predicted and staged; the same tap commits instantly.
-3. Press **Force wrong prediction**, then tap Electricity. The runtime rolls back its branch, reports aborted work and falls back to normal loading.
-4. Proceed to the payment summary. **Pay** is `commit_only`, so it can never be speculated; only the human tap crosses the boundary.
+1. Select **Lunch Break** and wait for Food to say **PRELOADED**.
+2. Tap Food. The branch commits atomically, the phone flashes green, and roughly 3 seconds is added to time saved with no new Food data request.
+3. Inside Food, wait for Biryani to preload, then tap it to demonstrate deep prediction and decoded image promotion.
+4. Reset, enable **Force wrong branch**, and choose the natural path. The speculative request is aborted immediately, the phone flashes red, discarded bytes are reported, and the baseline request runs normally.
+5. Use **Bill Due**, continue to the summary, and point out that **Confirm payment** is `commit_only`: it has no speculative API path and fires only after the human tap.
+
+The on-screen controls make every beat deterministic and re-runnable: AHEAD on/off, five contexts, three network presets, forced miss, and full session reset.
 
 ## Architecture
 
@@ -38,7 +41,7 @@ current screen + local history + network RTT
               atomic commit                     abort + discard
 ```
 
-The UI is a faithful interactive simulation of the SDK boundary. Runtime telemetry drives the dashboard: prediction, speculative branch lifecycle, commit/rollback result, latency saved, and safety-boundary events.
+The UI is a faithful interactive simulation of the SDK boundary. Runtime telemetry drives the dashboard: prediction, speculative branch lifecycle, measured latency saved, bytes discarded, and safety-boundary events. Speculative reads carry `X-Speculative: 1` and an AHEAD branch identifier so a production backend could shed that low-priority traffic first.
 
 ## Safety model
 
@@ -53,7 +56,7 @@ The model never invents an API call or a screen. It ranks only legal graph actio
 
 The model-agnostic predictor automatically chooses `gemma4:*`, then `gemma3:*`, then the local heuristic. Ollama JSON mode is followed by strict action-ID validation, deduplication and confidence normalization. Any timeout or contract failure triggers the heuristic in the same request.
 
-The current machine has `gemma3:4b` installed and benchmarked at roughly 0.8–1.6 seconds warm. Ollama's downloadable Gemma 4 E2B artifact is 7.2 GB on disk (distinct from Google's approximate 2.9 GB Q4 inference-memory figure), so the project intentionally does not exhaust the laptop's remaining disk space.
+The runtime prefers the locally installed `gemma4:e2b-it-qat`, then Gemma 3, and falls back to a deterministic on-device heuristic within a bounded timeout. The dashboard always labels the tier that actually produced the ranking.
 
 ```bash
 # Optional, after installing Ollama
@@ -62,4 +65,14 @@ ollama pull gemma4:e2b-it-qat
 AHEAD_MODEL=gemma4:e2b-it-qat npm run dev:api
 ```
 
-The visual demo remains fully functional without Ollama or network access, which makes it safe to present under venue-Wi-Fi failure conditions.
+The visual demo remains fully functional without Ollama or internet access, which makes it safe to present under venue-Wi-Fi failure conditions.
+
+## Verification
+
+```bash
+npm test
+npm run build
+curl http://127.0.0.1:8787/api/health
+```
+
+The automated suite gates matching ready commits, early-tap request adoption, wrong-branch rollback, AHEAD-off baseline behavior, honest saved-time math, deterministic latency, speculative traffic marking, and the absolute commit-only wall around payment and transfer.

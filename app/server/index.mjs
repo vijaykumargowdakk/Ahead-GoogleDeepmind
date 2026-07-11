@@ -2,7 +2,7 @@ import { createServer } from 'node:http'
 
 const OLLAMA = process.env.OLLAMA_URL || 'http://127.0.0.1:11434'
 const requestedModel = process.env.AHEAD_MODEL || 'gemma4:e2b-it-qat'
-const modelTimeoutMs = Number(process.env.AHEAD_MODEL_TIMEOUT_MS || 12000)
+const modelTimeoutMs = Number(process.env.AHEAD_MODEL_TIMEOUT_MS || 3500)
 const delays = { good: 250, congested: 1400, terrible: 3000 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const payloads = {
@@ -26,7 +26,7 @@ const payloads = {
 }
 
 const json = (res, status, body) => {
-  res.writeHead(status, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'access-control-allow-headers': 'content-type' })
+  res.writeHead(status, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'access-control-allow-headers': 'content-type,x-speculative,x-ahead-branch,x-ahead-baseline' })
   res.end(JSON.stringify(body))
 }
 const body = req => new Promise((resolve, reject) => {
@@ -106,8 +106,8 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/predict') return json(res, 200, await predict(await body(req)))
     if (req.method === 'GET' && payloads[url.pathname]) {
       const network = url.searchParams.get('network') in delays ? url.searchParams.get('network') : 'congested'
-      const jitter = Math.round(delays[network] * (.88 + Math.random() * .24)); await sleep(jitter)
-      return json(res, 200, { ...payloads[url.pathname], latencyMs: jitter, shadowSafe: true, servedFrom: 'simulated-mobile-api' })
+      const deterministicDelay = delays[network]; await sleep(deterministicDelay)
+      return json(res, 200, { ...payloads[url.pathname], latencyMs: deterministicDelay, shadowSafe: true, speculative: req.headers['x-speculative'] === '1', servedFrom: 'simulated-mobile-api' })
     }
     if (req.method === 'POST' && url.pathname === '/api/pay') return json(res, 200, { receiptId: `AHD-${Date.now()}`, status: 'paid', humanConfirmed: true })
     return json(res, 404, { error: 'not_found' })
