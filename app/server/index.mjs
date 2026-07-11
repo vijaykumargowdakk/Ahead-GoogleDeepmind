@@ -38,34 +38,59 @@ const normalize = ranked => {
   const total = ranked.reduce((sum, item) => sum + Number(item.confidence || 0), 0)
   return ranked.sort((a, b) => b.confidence - a.confidence).map(item => ({ ...item, confidence: item.confidence / total }))
 }
+const scenarioHash = (scenario, screen, length) => {
+  let hash = 2166136261
+  for (const character of `${scenario}:${screen}`) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619) >>> 0
+  return length ? hash % length : 0
+}
+const chooseFallbackAction = context => {
+  const legal = context.legalActionIds
+  const scenarioTarget = legal.find(id => id === context.scenarioTarget)
+  if (scenarioTarget) return scenarioTarget
+  const contextual = context.screenId === 'food'
+    ? legal.find(id => context.hourOfDay >= 18 ? id.includes('pasta') : context.hourOfDay >= 11 && context.hourOfDay <= 14 ? id.includes('biryani') : false)
+    : context.screenId === 'banking'
+      ? legal.find(id => context.dayOfMonth <= 2 ? id.includes('investment') : context.dayOfMonth >= 27 ? id.includes('balance') : false)
+      : context.screenId === 'utilities' && context.dayOfMonth === 14
+        ? legal.find(id => id.includes('electricity'))
+        : undefined
+  if (contextual) return contextual
+  const habitual = legal.reduce((best, id) => {
+    const count = Number((context.historySummary || '').match(new RegExp(`${id}=(\\d+)`))?.[1] || 0)
+    return count > best.count ? { id, count } : best
+  }, { count: 0 }).id
+  return habitual || legal[scenarioHash(context.scenario || 'unknown', context.screenId || 'unknown', legal.length)]
+}
 const heuristic = context => {
-  const scenarioTarget = context.legalActionIds.find(id => id === context.scenarioTarget)
-  const electrical = context.legalActionIds.find(id => id.includes('electricity'))
-  const food = context.legalActionIds.find(id => id.includes('food') || id.includes('biryani') || id.includes('pasta'))
-  const habitual = [...context.legalActionIds].sort((a, b) => {
-    const left = Number((context.historySummary || '').match(new RegExp(`${a}=(\\d+)`))?.[1] || 0)
-    const right = Number((context.historySummary || '').match(new RegExp(`${b}=(\\d+)`))?.[1] || 0)
-    return right - left
-  })[0]
-  const review = context.legalActionIds.find(id => id.includes('review'))
-  const preferred = scenarioTarget || review || ((context.hourOfDay || 0) >= 11 && (context.hourOfDay || 0) <= 14 && food) || ((context.historySummary || '').includes(`${habitual}=`) && habitual) || (context.dayOfMonth === 14 && electrical) || context.legalActionIds[0]
+  const preferred = chooseFallbackAction(context)
   return normalize(context.legalActionIds.map(id => ({ actionId: id, confidence: id === preferred ? .82 : .18 / Math.max(context.legalActionIds.length - 1, 1) })))
+}
+const discoveryError = error => {
+  if (error?.name === 'TimeoutError') return 'timeout'
+  if (error?.cause?.code === 'ECONNREFUSED') return 'connection_refused'
+  if (error?.cause?.code === 'ENOTFOUND') return 'dns_error'
+  return 'request_failed'
 }
 async function availableModels() {
   try {
-    const result = await fetch(`${OLLAMA}/api/tags`, { signal: AbortSignal.timeout(1000) }).then(r => r.json())
-    return result.models?.map(item => item.name) || []
-  } catch { return [] }
+    const response = await fetch(`${OLLAMA}/api/tags`, { signal: AbortSignal.timeout(1500) })
+    if (!response.ok) return { models: [], error: `http_${response.status}` }
+    const result = await response.json()
+    if (!Array.isArray(result.models)) return { models: [], error: 'invalid_response' }
+    return { models: result.models.map(item => item.name).filter(Boolean), error: null }
+  } catch (error) { return { models: [], error: discoveryError(error) } }
 }
 async function chooseModel() {
-  const models = await availableModels()
-  if (models.includes(requestedModel)) return requestedModel
-  return models.find(name => name.startsWith('gemma4:')) || models.find(name => name.startsWith('gemma3:')) || null
+  const discovery = await availableModels()
+  const model = discovery.models.includes(requestedModel) ? requestedModel : discovery.models.find(name => name.startsWith('gemma4:')) || discovery.models.find(name => name.startsWith('gemma3:')) || null
+  const reason = model ? null : discovery.error ? `ollama_${discovery.error}` : discovery.models.length ? `no_compatible_gemma_model:${discovery.models.join(',')}` : 'ollama_no_models_installed'
+  return { ...discovery, model, reason }
 }
 
 async function predict(context) {
-  const fallback = { ranked: heuristic(context), latencyMs: 0, source: 'heuristic', model: null }
-  const model = await chooseModel()
+  const discovery = await chooseModel()
+  const fallback = { ranked: heuristic(context), latencyMs: 0, source: 'heuristic', model: null, fallbackReason: discovery.reason }
+  const model = discovery.model
   if (!model) return fallback
   const started = performance.now()
   try {
@@ -100,8 +125,8 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1')
   try {
     if (req.method === 'GET' && url.pathname === '/api/health') {
-      const model = await chooseModel()
-      return json(res, 200, { ok: true, ollama: Boolean(model), model, requestedModel, mode: model ? 'local-model' : 'heuristic', modelTimeoutMs })
+      const discovery = await chooseModel()
+      return json(res, 200, { ok: true, ollama: !discovery.error, modelAvailable: Boolean(discovery.model), model: discovery.model, requestedModel, availableModels: discovery.models, ollamaUrl: OLLAMA, diagnostic: discovery.reason, mode: discovery.model ? 'local-model' : 'heuristic', modelTimeoutMs })
     }
     if (req.method === 'POST' && url.pathname === '/api/predict') return json(res, 200, await predict(await body(req)))
     if (req.method === 'GET' && payloads[url.pathname]) {
@@ -114,4 +139,5 @@ const server = createServer(async (req, res) => {
   } catch (error) { return json(res, 500, { error: error.message }) }
 })
 
-server.listen(Number(process.env.PORT || 8787), '127.0.0.1', () => console.log('AHEAD API listening at http://127.0.0.1:8787'))
+const port = Number(process.env.PORT || 8787)
+server.listen(port, '127.0.0.1', () => console.log(`AHEAD API listening at http://127.0.0.1:${port}`))

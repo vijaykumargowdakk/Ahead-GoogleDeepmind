@@ -13,11 +13,11 @@ type ShadowPayload = { branchId: string; actionId: string; path: string; ready: 
 type Inspector = { systemPrompt: string; userPrompt: string; context: Record<string, unknown>; raw: string; fallbackReason?: string }
 
 const scenarios: Record<ScenarioId, { label: string; hour: number; day: number; signal: string; targets: Partial<Record<Screen, string>> }> = {
-  lunch: { label: 'Lunch Break (1:00 PM)', hour: 13, day: 11, signal: 'Lunch hour: user usually opens Food and orders Biryani.', targets: { home: 'open_food_app', food: 'order_biryani' } },
-  dinner: { label: 'Dinner Time (8:00 PM)', hour: 20, day: 11, signal: 'Dinner hour: user usually opens Food and orders Pasta.', targets: { home: 'open_food_app', food: 'order_pasta' } },
-  payday: { label: 'Payday (1st)', hour: 10, day: 1, signal: 'Salary credited: user usually opens Banking and checks investments.', targets: { home: 'open_banking_app', banking: 'view_investments' } },
-  monthEnd: { label: 'Month End (28th)', hour: 18, day: 28, signal: 'Month end budget check: user usually opens Banking and checks balance.', targets: { home: 'open_banking_app', banking: 'check_balance' } },
-  billDue: { label: 'Bill Due (14th)', hour: 9, day: 14, signal: 'Electricity bill due today: user usually opens Utilities and pays electricity.', targets: { home: 'open_utilities_app', utilities: 'open_electricity_bill' } },
+  lunch: { label: 'Lunch Break (1:00 PM)', hour: 13, day: 11, signal: 'Lunch hour: user usually opens Food and orders Biryani.', targets: { home: 'open_food_app', food: 'order_biryani', biryani: 'checkout_biryani', summary: 'pay_now', receipt: 'back_home' } },
+  dinner: { label: 'Dinner Time (8:00 PM)', hour: 20, day: 11, signal: 'Dinner hour: user usually opens Food and orders Pasta.', targets: { home: 'open_food_app', food: 'order_pasta', pasta: 'checkout_pasta', summary: 'pay_now', receipt: 'back_home' } },
+  payday: { label: 'Payday (1st)', hour: 10, day: 1, signal: 'Salary credited: user usually opens Banking and checks investments.', targets: { home: 'open_banking_app', banking: 'view_investments', investments: 'back_home_from_investments', summary: 'pay_now', receipt: 'back_home' } },
+  monthEnd: { label: 'Month End (28th)', hour: 18, day: 28, signal: 'Month end budget check: user usually opens Banking and checks balance.', targets: { home: 'open_banking_app', banking: 'check_balance', balance: 'transfer_from_balance', transfer: 'confirm_transfer', receipt: 'back_home' } },
+  billDue: { label: 'Bill Due (14th)', hour: 9, day: 14, signal: 'Electricity bill due today: user usually opens Utilities and pays electricity.', targets: { home: 'open_utilities_app', utilities: 'open_electricity_bill', electricity: 'review_electricity_payment', summary: 'pay_now', receipt: 'back_home' } },
 }
 
 const graph: Record<Screen, Action[]> = {
@@ -89,10 +89,34 @@ function scenarioMemory(scenario: ScenarioId, screen: Screen) {
   return target ? `scenario target for this screen is ${target}; ${config.signal}` : config.signal
 }
 
+function scenarioHash(scenario: string, screen: string, length: number) {
+  let hash = 2166136261
+  for (const character of `${scenario}:${screen}`) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619) >>> 0
+  return length ? hash % length : 0
+}
+
+function chooseFallbackAction(input: { legalActionIds: string[]; scenario: string; screenId: string; scenarioTarget?: string; hourOfDay: number; dayOfMonth: number; historySummary?: string }) {
+  const legal = input.legalActionIds
+  if (input.scenarioTarget && legal.includes(input.scenarioTarget)) return input.scenarioTarget
+  const contextual = input.screenId === 'food'
+    ? legal.find(id => input.hourOfDay >= 18 ? id.includes('pasta') : input.hourOfDay >= 11 && input.hourOfDay <= 14 ? id.includes('biryani') : false)
+    : input.screenId === 'banking'
+      ? legal.find(id => input.dayOfMonth <= 2 ? id.includes('investment') : input.dayOfMonth >= 27 ? id.includes('balance') : false)
+      : input.screenId === 'utilities' && input.dayOfMonth === 14
+        ? legal.find(id => id.includes('electricity'))
+        : undefined
+  if (contextual) return contextual
+  const habitual = legal.reduce<{ id?: string; count: number }>((best, id) => {
+    const count = Number((input.historySummary || '').match(new RegExp(`${id}=(\\d+)`))?.[1] || 0)
+    return count > best.count ? { id, count } : best
+  }, { count: 0 }).id
+  return habitual || legal[scenarioHash(input.scenario, input.screenId, legal.length)]
+}
+
 function fallbackPrediction(screen: Screen, forcedWrong: boolean, scenario: ScenarioId) {
   const actions = graph[screen]
-  const target = scenarios[scenario].targets[screen]
-  const preferred = actions.some(action => action.id === target) ? target! : actions[0].id
+  const config = scenarios[scenario]
+  const preferred = chooseFallbackAction({ legalActionIds: actions.map(action => action.id), scenario, screenId: screen, scenarioTarget: config.targets[screen], hourOfDay: config.hour, dayOfMonth: config.day, historySummary: scenarioMemory(scenario, screen) })
   const pick = forcedWrong && actions.length > 1 ? actions.find(action => action.id !== preferred)!.id : preferred
   return actions.map(action => ({ actionId: action.id, confidence: action.id === pick ? 0.82 : +(0.18 / Math.max(actions.length - 1, 1)).toFixed(2) }))
 }
@@ -119,7 +143,7 @@ export default function App() {
   const [forceWrong, setForceWrong] = useState(false)
   const [branch, setBranch] = useState<{ id: string; actionId: string; state: BranchState }>({ id: 'B-000', actionId: 'none', state: 'idle' })
   const [prediction, setPrediction] = useState<Ranked[]>(() => fallbackPrediction('home', false, 'lunch'))
-  const [predictor, setPredictor] = useState({ source: 'connecting', model: 'Detecting Ollama...', latencyMs: 0 })
+  const [predictor, setPredictor] = useState({ source: 'connecting', model: 'Detecting Ollama...', latencyMs: 0, diagnostic: 'checking local runtime' as string | undefined })
   const [shadow, setShadow] = useState<ShadowPayload | null>(null)
   const [events, setEvents] = useState<Telemetry[]>([])
   const [saved, setSaved] = useState(0)
@@ -177,7 +201,7 @@ export default function App() {
         fallbackReason = 'frontend_timeout_or_api_unavailable'
       }
       if (cancelled) return
-      setPrediction(ranked); setPredictor({ source, model, latencyMs }); setInspector({ systemPrompt, userPrompt, context, raw, fallbackReason })
+      setPrediction(ranked); setPredictor({ source, model, latencyMs, diagnostic: fallbackReason }); setInspector({ systemPrompt, userPrompt, context, raw, fallbackReason })
       const chosen = ranked[0]
       const action = graph[screen].find(item => item.id === chosen.actionId)
       if (!ahead || !action?.speculatable || chosen.confidence < .5 || network === 'good') return
@@ -268,12 +292,12 @@ export default function App() {
       <aside className="dash">
         <div className="eyebrow">V3 X-RAY ENGINE ROOM</div>
         <div className="headline"><h1>Deep intent prediction <span>{(saved / 1000).toFixed(1)}s saved</span></h1><p>Gemma predicts app launch, then predicts inside the app. AHEAD preloads JSON and rich media into shadow memory before the user taps.</p></div>
-        <div className="grid stats"><div><small>PREDICTOR</small><b>{predictor.source === 'gemma4' ? 'Gemma 4' : predictor.source === 'gemma3' ? 'Gemma 3' : 'Heuristic'}</b><em>{predictor.model} · {predictor.latencyMs}ms</em></div><div><small>NETWORK</small><b>{latency[network]}ms</b><em className={network}>● {network.toUpperCase()}</em></div><div><small>ACCURACY</small><b>{score}%</b><em>{hits} commits · {misses} rollbacks</em></div></div>
+        <div className="grid stats"><div><small>PREDICTOR</small><b>{predictor.source === 'gemma4' ? 'Gemma 4' : predictor.source === 'gemma3' ? 'Gemma 3' : 'Heuristic'}</b><em>{predictor.model} · {predictor.latencyMs}ms</em>{predictor.diagnostic && <small title={predictor.diagnostic}>↳ {predictor.diagnostic.replaceAll('_', ' ')}</small>}</div><div><small>NETWORK</small><b>{latency[network]}ms</b><em className={network}>● {network.toUpperCase()}</em></div><div><small>ACCURACY</small><b>{score}%</b><em>{hits} commits · {misses} rollbacks</em></div></div>
+        <section className="controls"><label><input type="checkbox" checked={ahead} onChange={event => setAhead(event.target.checked)} /><span>AHEAD {ahead ? 'ON' : 'OFF'}</span></label><select value={scenario} onChange={event => chooseScenario(event.target.value as ScenarioId)}>{Object.entries(scenarios).map(([id, item]) => <option key={id} value={id}>{item.label}</option>)}</select><select value={network} onChange={event => setNetwork(event.target.value as Network)}><option value="good">Good · 250ms</option><option value="congested">Congested · 1.4s</option><option value="terrible">Terrible · 3s</option></select><button onClick={() => setForceWrong(value => !value)} className={forceWrong ? 'wrong active' : 'wrong'}>Force wrong branch</button></section>
         <section className="panel graph-panel"><div className="panel-title"><span>DECISION GRAPH</span><small>{branch.state.toUpperCase()} · {branch.id}</small></div><svg viewBox="0 0 680 250">{edges.map(edge => { const from = nodePos[edge.from]!; const to = nodePos[edge.to]!; return <line key={`${edge.from}-${edge.id}`} x1={from.x} y1={from.y} x2={to.x} y2={to.y} className={edge.id === predictedId ? 'edge active' : 'edge'} /> })}{Object.entries(nodePos).map(([id, pos]) => <g key={id} className={screen === id ? 'node current' : predictedAction?.screen === id ? 'node predicted' : 'node'}><circle cx={pos.x} cy={pos.y} r="14" /><text x={pos.x} y={pos.y + 31}>{id}</text></g>)}</svg></section>
-        <div className="split"><section className="panel"><div className="panel-title"><span>GEMMA RANKING</span><small>{screen.toUpperCase()}</small></div>{prediction.map(item => <div className="prediction" key={item.actionId}><div><b>{actions.find(action => action.id === item.actionId)?.label || item.actionId}</b><span>{Math.round(item.confidence * 100)}%</span></div><i><u style={{ width: `${item.confidence * 100}%` }} /></i></div>)}</section><section className="panel race"><div className="panel-title"><span>LATENCY RACE</span><small>{race.status}</small></div><div><span>Normal request</span><i><u style={{ width: `${Math.min(100, latency[network] / 30)}%` }} /></i><b>{race.normalMs}ms</b></div><div><span>Shadow commit</span><i><u className="fast" style={{ width: `${race.status.includes('won') ? 8 : 0}%` }} /></i><b>{race.status.includes('won') ? `${race.shadowMs}ms` : 'ready'}</b></div></section></div>
         <div className="split"><section className="panel json-panel"><div className="panel-title"><span>SHADOW MEMORY</span><small>{shadow?.imageUrl ? 'IMAGE + JSON' : shadow?.ready ? 'JSON' : 'WAITING'}</small></div><pre>{JSON.stringify(shadow || { state: 'no shadow branch yet' }, null, 2)}</pre></section><section className="panel json-panel"><div className="panel-title"><span>OLLAMA PIPELINE</span><small>{scenario}</small></div><pre>{JSON.stringify({ user: inspector.userPrompt, raw: inspector.raw, fallbackReason: inspector.fallbackReason }, null, 2)}</pre></section></div>
         <section className="panel events"><div className="panel-title"><span>EVENT STREAM</span><small>{scenarios[scenario].signal}</small></div>{events.length ? events.map((event, index) => <p key={`${event.time}-${index}`}><time>{event.time}</time><b>{event.type}</b>{event.detail}</p>) : <p>Runtime standing by...</p>}</section>
-        <section className="controls"><label><input type="checkbox" checked={ahead} onChange={event => setAhead(event.target.checked)} /><span>AHEAD {ahead ? 'ON' : 'OFF'}</span></label><select value={scenario} onChange={event => chooseScenario(event.target.value as ScenarioId)}>{Object.entries(scenarios).map(([id, item]) => <option key={id} value={id}>{item.label}</option>)}</select><select value={network} onChange={event => setNetwork(event.target.value as Network)}><option value="good">Good · 250ms</option><option value="congested">Congested · 1.4s</option><option value="terrible">Terrible · 3s</option></select><button onClick={() => setForceWrong(value => !value)} className={forceWrong ? 'wrong active' : 'wrong'}>Force wrong branch</button></section>
+        <div className="split"><section className="panel"><div className="panel-title"><span>GEMMA RANKING</span><small>{screen.toUpperCase()}</small></div>{prediction.map(item => <div className="prediction" key={item.actionId}><div><b>{actions.find(action => action.id === item.actionId)?.label || item.actionId}</b><span>{Math.round(item.confidence * 100)}%</span></div><i><u style={{ width: `${item.confidence * 100}%` }} /></i></div>)}</section><section className="panel race"><div className="panel-title"><span>LATENCY RACE</span><small>{race.status}</small></div><div><span>Normal request</span><i><u style={{ width: `${Math.min(100, latency[network] / 30)}%` }} /></i><b>{race.normalMs}ms</b></div><div><span>Shadow commit</span><i><u className="fast" style={{ width: `${race.status.includes('won') ? 8 : 0}%` }} /></i><b>{race.status.includes('won') ? `${race.shadowMs}ms` : 'ready'}</b></div></section></div>
       </aside>
     </section>
   </main>
