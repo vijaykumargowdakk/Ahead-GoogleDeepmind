@@ -11,6 +11,8 @@ const payloads = {
   '/api/apps/banking': { app: 'Banking', safePrefetch: ['balance_summary', 'investment_overview', 'transfer_contacts'], commitOnly: ['send_money'] },
   '/api/apps/utilities': { due: [{ provider: 'BESCOM', amount: 1248, dueDate: '2026-07-14' }, { provider: 'BWSSB', amount: 438, dueDate: '2026-07-18' }], bytes: 18240 },
   '/api/apps/shop': { deals: [{ sku: 'buds-pro', discount: 42 }, { sku: 'desk-lamp', discount: 28 }], cartItems: 1 },
+  '/api/shop/deals': { deals: [{ sku: 'buds-pro', discount: 42 }, { sku: 'desk-lamp', discount: 28 }], checkoutPrepared: true },
+  '/api/shop/orders': { orders: [{ id: 'AHD-2048', status: 'Out for delivery' }, { id: 'AHD-1984', status: 'Delivered' }] },
   '/api/food/biryani': { dish: 'Hyderabadi Biryani', price: 329, etaMin: 24, imageUrl: '/food/biryani.png', bytes: 2680000 },
   '/api/food/pasta': { dish: 'Creamy Tomato Pasta', price: 289, etaMin: 31, imageUrl: '/food/pasta.png', bytes: 2460000 },
   '/api/food/nearby': { restaurants: [{ name: 'Biryani House', etaMin: 22 }, { name: 'Pasta Bar', etaMin: 31 }] },
@@ -131,8 +133,10 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/predict') return json(res, 200, await predict(await body(req)))
     if (req.method === 'GET' && payloads[url.pathname]) {
       const network = url.searchParams.get('network') in delays ? url.searchParams.get('network') : 'congested'
-      const jitter = Math.round(delays[network] * (.88 + Math.random() * .24)); await sleep(jitter)
-      return json(res, 200, { ...payloads[url.pathname], latencyMs: jitter, shadowSafe: true, servedFrom: 'simulated-mobile-api' })
+      const speculative = url.searchParams.get('speculative') === '1'
+      const requestDelay = speculative ? Math.min(delays[network], 160) : Math.round(delays[network] * (.88 + Math.random() * .24))
+      await sleep(requestDelay)
+      return json(res, 200, { ...payloads[url.pathname], latencyMs: requestDelay, speculative, shadowSafe: true, servedFrom: 'simulated-mobile-api' })
     }
     if (req.method === 'POST' && url.pathname === '/api/pay') return json(res, 200, { receiptId: `AHD-${Date.now()}`, status: 'paid', humanConfirmed: true })
     return json(res, 404, { error: 'not_found' })
