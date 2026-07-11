@@ -3,30 +3,26 @@ import { createServer } from 'node:http'
 const OLLAMA = process.env.OLLAMA_URL || 'http://127.0.0.1:11434'
 const requestedModel = process.env.AHEAD_MODEL || 'gemma4:e2b-it-qat'
 const modelTimeoutMs = Number(process.env.AHEAD_MODEL_TIMEOUT_MS || 12000)
-const delays = { good: 250, congested: 2500, terrible: 5000 }
+const delays = { good: 250, congested: 1400, terrible: 3000 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const payloads = {
-  '/api/super/home': { modules: ['utilities', 'food', 'shopping', 'orders'], cachedAt: 'edge-shadow' },
-  '/api/super/utilities': { due: [{ provider: 'BESCOM', amount: 1248 }, { provider: 'BWSSB', amount: 438 }, { provider: 'Airtel Fiber', amount: 999 }], bytes: 18240 },
-  '/api/super/food': { hourSignal: 'lunch_window', reorder: { restaurant: 'Green Bowl', item: 'Paneer power bowl', etaMin: 24 }, nearby: 18 },
-  '/api/super/shop': { deals: [{ sku: 'buds-pro', discount: 42 }, { sku: 'desk-lamp', discount: 28 }], cartItems: 1 },
-  '/api/super/orders': { orders: [{ id: 'ORD-2048', status: 'out_for_delivery' }, { id: 'BILL-7784', status: 'paid_last_month' }] },
+  '/api/apps/home': { apps: ['Food', 'Banking', 'Utilities', 'Shop'], cachedAt: 'shadow-home' },
+  '/api/apps/food': { app: 'Food', featured: ['Biryani', 'Pasta'], mediaPolicy: 'preload predicted dish image' },
+  '/api/apps/banking': { app: 'Banking', safePrefetch: ['balance_summary', 'investment_overview', 'transfer_contacts'], commitOnly: ['send_money'] },
+  '/api/apps/utilities': { due: [{ provider: 'BESCOM', amount: 1248, dueDate: '2026-07-14' }, { provider: 'BWSSB', amount: 438, dueDate: '2026-07-18' }], bytes: 18240 },
+  '/api/apps/shop': { deals: [{ sku: 'buds-pro', discount: 42 }, { sku: 'desk-lamp', discount: 28 }], cartItems: 1 },
+  '/api/food/biryani': { dish: 'Hyderabadi Biryani', price: 329, etaMin: 24, imageUrl: '/food/biryani.png', bytes: 2680000 },
+  '/api/food/pasta': { dish: 'Creamy Tomato Pasta', price: 289, etaMin: 31, imageUrl: '/food/pasta.png', bytes: 2460000 },
+  '/api/food/nearby': { restaurants: [{ name: 'Biryani House', etaMin: 22 }, { name: 'Pasta Bar', etaMin: 31 }] },
+  '/api/banking/investments': { portfolioValue: 482300, todayChangePct: 2.8, paydaySignal: true, commitOnly: false },
+  '/api/banking/balance': { availableBalance: 82440, monthEndBudget: 12600, upcomingDebits: 3, commitOnly: false },
+  '/api/banking/transfer': { recentPayees: ['Aarav', 'Rent', 'Credit Card'], preparedOnly: true, commitOnly: true },
   '/api/bills/electricity': { provider: 'BESCOM', account: '7784', amount: 1248, dueDate: '2026-07-14', bytes: 11842 },
   '/api/bills/water': { provider: 'BWSSB', account: '2201', amount: 438, dueDate: '2026-07-18', bytes: 8210 },
-  '/api/bills/internet': { provider: 'Airtel Fiber', plan: '300 Mbps', amount: 999, renewsOn: '2026-07-15', bytes: 10422 },
-  '/api/bills/gas': { provider: 'Indane', refill: '14.2kg cylinder', amount: 915, earliestSlot: 'Tomorrow 10 AM', bytes: 9144 },
   '/api/review/electricity': { merchant: 'BESCOM', amount: 1248, fee: 0, commitOnly: true },
   '/api/review/water': { merchant: 'BWSSB', amount: 438, fee: 0, commitOnly: true },
-  '/api/review/internet': { merchant: 'Airtel Fiber', amount: 999, fee: 0, commitOnly: true },
-  '/api/review/gas': { merchant: 'Indane Gas', amount: 915, fee: 0, commitOnly: true },
-  '/api/food/reorder': { restaurant: 'Green Bowl', items: ['Paneer power bowl', 'Lime soda'], total: 342, etaMin: 24 },
-  '/api/food/nearby': { restaurants: [{ name: 'Green Bowl', etaMin: 24 }, { name: 'Dosa Lab', etaMin: 19 }, { name: 'Noodle Bar', etaMin: 31 }] },
-  '/api/food/cart': { items: ['Paneer power bowl'], subtotal: 298, surge: 0 },
-  '/api/review/food': { merchant: 'Green Bowl', amount: 342, fee: 12, commitOnly: true },
-  '/api/shop/deals': { deals: [{ title: 'Earbuds Pro', price: 2499, discount: 42 }, { title: 'Desk Lamp', price: 1199, discount: 28 }] },
-  '/api/shop/search': { query: 'recent interests', results: ['USB-C hub', 'Desk lamp', 'Running shoes'] },
-  '/api/review/deal': { merchant: 'AHEAD Mall', amount: 2499, fee: 0, commitOnly: true },
-  '/api/receipts': { receipts: [{ id: 'rcpt-0626', provider: 'BESCOM', amount: 1197, paidAt: '2026-06-02' }] },
+  '/api/review/biryani': { merchant: 'Biryani House', amount: 329, fee: 18, commitOnly: true, imageUrl: '/food/biryani.png' },
+  '/api/review/pasta': { merchant: 'Pasta Bar', amount: 289, fee: 16, commitOnly: true, imageUrl: '/food/pasta.png' },
 }
 
 const json = (res, status, body) => {
@@ -43,15 +39,16 @@ const normalize = ranked => {
   return ranked.sort((a, b) => b.confidence - a.confidence).map(item => ({ ...item, confidence: item.confidence / total }))
 }
 const heuristic = context => {
+  const scenarioTarget = context.legalActionIds.find(id => id === context.scenarioTarget)
   const electrical = context.legalActionIds.find(id => id.includes('electricity'))
-  const food = context.legalActionIds.find(id => id.includes('food') || id.includes('lunch'))
+  const food = context.legalActionIds.find(id => id.includes('food') || id.includes('biryani') || id.includes('pasta'))
   const habitual = [...context.legalActionIds].sort((a, b) => {
     const left = Number((context.historySummary || '').match(new RegExp(`${a}=(\\d+)`))?.[1] || 0)
     const right = Number((context.historySummary || '').match(new RegExp(`${b}=(\\d+)`))?.[1] || 0)
     return right - left
   })[0]
   const review = context.legalActionIds.find(id => id.includes('review'))
-  const preferred = review || ((context.hourOfDay || 0) >= 11 && (context.hourOfDay || 0) <= 14 && food) || ((context.historySummary || '').includes(`${habitual}=`) && habitual) || (context.dayOfMonth <= 4 && electrical) || context.legalActionIds[0]
+  const preferred = scenarioTarget || review || ((context.hourOfDay || 0) >= 11 && (context.hourOfDay || 0) <= 14 && food) || ((context.historySummary || '').includes(`${habitual}=`) && habitual) || (context.dayOfMonth === 14 && electrical) || context.legalActionIds[0]
   return normalize(context.legalActionIds.map(id => ({ actionId: id, confidence: id === preferred ? .82 : .18 / Math.max(context.legalActionIds.length - 1, 1) })))
 }
 async function availableModels() {
@@ -78,8 +75,8 @@ async function predict(context) {
         model, stream: false, think: false, keep_alive: '20m', format: 'json',
         options: { temperature: 0, num_predict: 80, num_ctx: 1024 },
         messages: [
-          { role: 'system', content: 'You are the intent predictor inside a mobile speculative execution runtime. Return JSON only: {"rankedActionIds":["exact_id"]}. Use only legal IDs. Rank by what the user is likely to tap next from the current screen. Strong signals: repeated local tap history, hour-of-day context, bill due dates, and action hints. Include every legal ID exactly once if possible.' },
-          { role: 'user', content: `Current screen=${context.screenId}. Legal actions with hints=${(context.legalActionHints || context.legalActionIds).join(' | ')}. hour=${context.hourOfDay}; day=${context.dayOfMonth}; local behavior=${context.historySummary}; recent taps=${context.recentTaps.join(',') || 'none'}; network=${context.networkRttMs}ms. Rank next tap IDs, most likely first.` }
+          { role: 'system', content: 'You are Gemma inside AHEAD, a mobile speculative execution runtime. Return JSON only: {"rankedActionIds":["exact_id"]}. Use only legal IDs. Rank the next likely tap. Strong signals: explicit scenario target, hour, day-of-month, action hints, and local behavior. Include every legal ID exactly once if possible.' },
+          { role: 'user', content: `Scenario=${context.scenarioLabel}; signal=${context.scenarioSignal}; current screen=${context.screenId}; legal actions=${(context.legalActionHints || context.legalActionIds).join(' | ')}; scenario target=${context.scenarioTarget}; hour=${context.hourOfDay}; day=${context.dayOfMonth}; behavior=${context.historySummary}; recent=${context.recentTaps.join(',') || 'none'}; network=${context.networkRttMs}ms. Rank next tap IDs, most likely first.` }
         ]
       })
     })

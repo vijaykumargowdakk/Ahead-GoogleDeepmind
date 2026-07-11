@@ -1,178 +1,167 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import './index.css'
 
 type Network = 'good' | 'congested' | 'terrible'
-type Screen = 'home' | 'utilities' | 'electricity' | 'water' | 'internet' | 'gas' | 'food' | 'cart' | 'shop' | 'deals' | 'orders' | 'summary' | 'receipt'
-type EventType = 'prediction_made' | 'speculation_started' | 'shadow_hydrated' | 'branch_committed' | 'branch_rolled_back' | 'boundary_blocked'
-type Telemetry = { type: EventType; detail: string; time: string }
-type Action = { id: string; label: string; screen: Screen; speculatable: boolean; icon: string; apiPath?: string; subtitle?: string }
+type ScenarioId = 'lunch' | 'dinner' | 'payday' | 'monthEnd' | 'billDue'
+type Screen = 'home' | 'food' | 'biryani' | 'pasta' | 'banking' | 'investments' | 'balance' | 'transfer' | 'utilities' | 'electricity' | 'water' | 'summary' | 'receipt'
+type BranchState = 'idle' | 'speculating' | 'committed' | 'rolledback'
+type EventType = 'prediction_made' | 'speculation_started' | 'image_preloaded' | 'shadow_hydrated' | 'branch_committed' | 'branch_rolled_back' | 'boundary_blocked'
+type Action = { id: string; label: string; screen: Screen; speculatable: boolean; icon: string; apiPath?: string; subtitle: string; appTint?: string }
 type Ranked = { actionId: string; confidence: number }
-type UserPattern = { tapCounts: Record<string, number>; recentTaps: string[]; totalTaps: number }
-type ShadowPayload = { branchId: string; actionId: string; path: string; ready: boolean; payload: unknown; latencyMs: number }
-type Inspector = {
-  systemPrompt: string
-  userPrompt: string
-  context: Record<string, unknown>
-  raw: string
-  fallbackReason?: string
+type Telemetry = { type: EventType; detail: string; time: string }
+type ShadowPayload = { branchId: string; actionId: string; path: string; ready: boolean; payload: Record<string, unknown>; latencyMs: number; imageUrl?: string }
+type Inspector = { systemPrompt: string; userPrompt: string; context: Record<string, unknown>; raw: string; fallbackReason?: string }
+
+const scenarios: Record<ScenarioId, { label: string; hour: number; day: number; signal: string; targets: Partial<Record<Screen, string>> }> = {
+  lunch: { label: 'Lunch Break (1:00 PM)', hour: 13, day: 11, signal: 'Lunch hour: user usually opens Food and orders Biryani.', targets: { home: 'open_food_app', food: 'order_biryani' } },
+  dinner: { label: 'Dinner Time (8:00 PM)', hour: 20, day: 11, signal: 'Dinner hour: user usually opens Food and orders Pasta.', targets: { home: 'open_food_app', food: 'order_pasta' } },
+  payday: { label: 'Payday (1st)', hour: 10, day: 1, signal: 'Salary credited: user usually opens Banking and checks investments.', targets: { home: 'open_banking_app', banking: 'view_investments' } },
+  monthEnd: { label: 'Month End (28th)', hour: 18, day: 28, signal: 'Month end budget check: user usually opens Banking and checks balance.', targets: { home: 'open_banking_app', banking: 'check_balance' } },
+  billDue: { label: 'Bill Due (14th)', hour: 9, day: 14, signal: 'Electricity bill due today: user usually opens Utilities and pays electricity.', targets: { home: 'open_utilities_app', utilities: 'open_electricity_bill' } },
 }
 
 const graph: Record<Screen, Action[]> = {
   home: [
-    { id: 'open_utilities', label: 'Utilities', screen: 'utilities', speculatable: true, icon: '⚡', apiPath: '/api/super/utilities', subtitle: 'Bills due, usage, providers' },
-    { id: 'open_food', label: 'Lunch run', screen: 'food', speculatable: true, icon: '🍱', apiPath: '/api/super/food', subtitle: 'Reorder and nearby food' },
-    { id: 'open_shop', label: 'Daily deals', screen: 'shop', speculatable: true, icon: '🛒', apiPath: '/api/super/shop', subtitle: 'Offers, orders, cart' },
-    { id: 'open_orders', label: 'Orders', screen: 'orders', speculatable: true, icon: '▤', apiPath: '/api/super/orders', subtitle: 'Receipts and tracking' },
+    { id: 'open_food_app', label: 'Food', screen: 'food', speculatable: true, icon: 'Food', apiPath: '/api/apps/food', subtitle: 'Meals and reorders', appTint: '#ff7658' },
+    { id: 'open_banking_app', label: 'Banking', screen: 'banking', speculatable: true, icon: 'Bank', apiPath: '/api/apps/banking', subtitle: 'Balance, transfer, invest', appTint: '#66e7a8' },
+    { id: 'open_utilities_app', label: 'Utilities', screen: 'utilities', speculatable: true, icon: 'Bill', apiPath: '/api/apps/utilities', subtitle: 'Electricity and water', appTint: '#66d9ff' },
+    { id: 'open_shop_app', label: 'Shop', screen: 'receipt', speculatable: true, icon: 'Shop', apiPath: '/api/apps/shop', subtitle: 'Orders and deals', appTint: '#b896ff' },
   ],
-  utilities: [
-    { id: 'open_electricity_bill', label: 'Electricity', screen: 'electricity', speculatable: true, icon: '⚡', apiPath: '/api/bills/electricity', subtitle: 'BESCOM due Jul 14' },
-    { id: 'open_water_bill', label: 'Water', screen: 'water', speculatable: true, icon: '◌', apiPath: '/api/bills/water', subtitle: 'BWSSB due Jul 18' },
-    { id: 'open_internet_bill', label: 'Internet', screen: 'internet', speculatable: true, icon: '⌁', apiPath: '/api/bills/internet', subtitle: 'Fiber renewal' },
-    { id: 'open_gas_bill', label: 'Gas', screen: 'gas', speculatable: true, icon: '▲', apiPath: '/api/bills/gas', subtitle: 'Cylinder refill' },
-  ],
-  electricity: [
-    { id: 'review_electricity_payment', label: 'Review payment', screen: 'summary', speculatable: true, icon: '→', apiPath: '/api/review/electricity', subtitle: 'Prepare checkout' },
-    { id: 'open_receipts', label: 'Past receipts', screen: 'orders', speculatable: true, icon: '▤', apiPath: '/api/receipts', subtitle: 'Payment history' },
-  ],
-  water: [{ id: 'review_water_payment', label: 'Review water bill', screen: 'summary', speculatable: true, icon: '→', apiPath: '/api/review/water', subtitle: 'Prepare checkout' }],
-  internet: [{ id: 'review_internet_payment', label: 'Renew plan', screen: 'summary', speculatable: true, icon: '→', apiPath: '/api/review/internet', subtitle: 'Prepare checkout' }],
-  gas: [{ id: 'review_gas_payment', label: 'Book refill', screen: 'summary', speculatable: true, icon: '→', apiPath: '/api/review/gas', subtitle: 'Prepare checkout' }],
   food: [
-    { id: 'reorder_lunch', label: 'Reorder lunch', screen: 'cart', speculatable: true, icon: '↻', apiPath: '/api/food/reorder', subtitle: 'Paneer bowl from yesterday' },
-    { id: 'browse_nearby_food', label: 'Browse nearby', screen: 'cart', speculatable: true, icon: '⌖', apiPath: '/api/food/nearby', subtitle: 'Fast restaurants' },
-    { id: 'open_food_cart', label: 'Cart', screen: 'cart', speculatable: true, icon: '◫', apiPath: '/api/food/cart', subtitle: 'Ready to checkout' },
+    { id: 'order_biryani', label: 'Order Biryani', screen: 'biryani', speculatable: true, icon: 'Biryani', apiPath: '/api/food/biryani', subtitle: 'Lunch special, image + menu preload' },
+    { id: 'order_pasta', label: 'Order Pasta', screen: 'pasta', speculatable: true, icon: 'Pasta', apiPath: '/api/food/pasta', subtitle: 'Dinner favorite, image + menu preload' },
+    { id: 'browse_restaurants', label: 'Browse nearby', screen: 'food', speculatable: true, icon: 'Map', apiPath: '/api/food/nearby', subtitle: 'Fallback discovery path' },
   ],
-  cart: [{ id: 'checkout_food', label: 'Checkout lunch', screen: 'summary', speculatable: true, icon: '→', apiPath: '/api/review/food', subtitle: 'Prepare payment' }],
-  shop: [
-    { id: 'open_daily_deals', label: 'Daily deals', screen: 'deals', speculatable: true, icon: '%', apiPath: '/api/shop/deals', subtitle: 'Personalized offers' },
-    { id: 'search_products', label: 'Search products', screen: 'deals', speculatable: true, icon: '⌕', apiPath: '/api/shop/search', subtitle: 'Recent interests' },
-    { id: 'open_shop_orders', label: 'Orders', screen: 'orders', speculatable: true, icon: '▤', apiPath: '/api/super/orders', subtitle: 'Track shipments' },
+  biryani: [{ id: 'checkout_biryani', label: 'Checkout Biryani', screen: 'summary', speculatable: true, icon: 'Pay', apiPath: '/api/review/biryani', subtitle: 'Prepare order checkout' }],
+  pasta: [{ id: 'checkout_pasta', label: 'Checkout Pasta', screen: 'summary', speculatable: true, icon: 'Pay', apiPath: '/api/review/pasta', subtitle: 'Prepare order checkout' }],
+  banking: [
+    { id: 'view_investments', label: 'Investments', screen: 'investments', speculatable: true, icon: 'Grow', apiPath: '/api/banking/investments', subtitle: 'Payday portfolio view' },
+    { id: 'check_balance', label: 'Check balance', screen: 'balance', speculatable: true, icon: 'Cash', apiPath: '/api/banking/balance', subtitle: 'Month-end budget view' },
+    { id: 'transfer_money', label: 'Transfer', screen: 'transfer', speculatable: true, icon: 'Send', apiPath: '/api/banking/transfer', subtitle: 'Prepare contacts, no transfer' },
   ],
-  deals: [{ id: 'buy_daily_deal', label: 'Buy deal', screen: 'summary', speculatable: true, icon: '→', apiPath: '/api/review/deal', subtitle: 'Prepare checkout' }],
-  orders: [{ id: 'back_home', label: 'Back home', screen: 'home', speculatable: true, icon: '←', apiPath: '/api/super/home', subtitle: 'Return to start' }],
-  summary: [{ id: 'pay_now', label: 'Confirm payment', screen: 'receipt', speculatable: false, icon: '✓', subtitle: 'Human boundary' }],
-  receipt: [{ id: 'back_home', label: 'Back home', screen: 'home', speculatable: true, icon: '←', apiPath: '/api/super/home', subtitle: 'Return to start' }],
+  investments: [{ id: 'back_home_from_investments', label: 'Back home', screen: 'home', speculatable: true, icon: 'Home', apiPath: '/api/apps/home', subtitle: 'Return to home screen' }],
+  balance: [{ id: 'transfer_from_balance', label: 'Transfer money', screen: 'transfer', speculatable: true, icon: 'Send', apiPath: '/api/banking/transfer', subtitle: 'Prepare transfer form' }],
+  transfer: [{ id: 'confirm_transfer', label: 'Confirm transfer', screen: 'receipt', speculatable: false, icon: 'Lock', subtitle: 'Human confirmation required' }],
+  utilities: [
+    { id: 'open_electricity_bill', label: 'Electricity', screen: 'electricity', speculatable: true, icon: 'Power', apiPath: '/api/bills/electricity', subtitle: 'Due on the 14th' },
+    { id: 'open_water_bill', label: 'Water', screen: 'water', speculatable: true, icon: 'Water', apiPath: '/api/bills/water', subtitle: 'Lower urgency bill' },
+  ],
+  electricity: [{ id: 'review_electricity_payment', label: 'Review payment', screen: 'summary', speculatable: true, icon: 'Pay', apiPath: '/api/review/electricity', subtitle: 'Prepare bill checkout' }],
+  water: [{ id: 'review_water_payment', label: 'Review water bill', screen: 'summary', speculatable: true, icon: 'Pay', apiPath: '/api/review/water', subtitle: 'Prepare bill checkout' }],
+  summary: [{ id: 'pay_now', label: 'Confirm payment', screen: 'receipt', speculatable: false, icon: 'Lock', subtitle: 'Commit-only side effect' }],
+  receipt: [{ id: 'back_home', label: 'Back home', screen: 'home', speculatable: true, icon: 'Home', apiPath: '/api/apps/home', subtitle: 'Reset demo path' }],
 }
 
-const latency: Record<Network, number> = { good: 250, congested: 2500, terrible: 5000 }
+const latency: Record<Network, number> = { good: 250, congested: 1400, terrible: 3000 }
 const title: Record<Screen, string> = {
-  home: 'AHEAD Super App',
+  home: 'iPhone Home',
+  food: 'Food',
+  biryani: 'Biryani ready',
+  pasta: 'Pasta ready',
+  banking: 'Banking',
+  investments: 'Investments',
+  balance: 'Balance',
+  transfer: 'Transfer',
   utilities: 'Utilities',
   electricity: 'Electricity bill',
   water: 'Water bill',
-  internet: 'Internet plan',
-  gas: 'Gas refill',
-  food: 'Lunch delivery',
-  cart: 'Smart cart',
-  shop: 'Shopping',
-  deals: 'Daily deals',
-  orders: 'Orders',
   summary: 'Commit boundary',
-  receipt: 'Receipt',
+  receipt: 'Done',
 }
-
-const emptyPattern: UserPattern = { tapCounts: {}, recentTaps: ['app_opened'], totalTaps: 0 }
-const systemPrompt = 'Return JSON only: {"rankedActionIds":["exact_id"]}. Include every legal ID exactly once from most to least likely. Never invent IDs.'
 const nodePos: Partial<Record<Screen, { x: number; y: number }>> = {
-  home: { x: 60, y: 126 },
-  utilities: { x: 190, y: 60 },
-  food: { x: 190, y: 126 },
-  shop: { x: 190, y: 192 },
-  electricity: { x: 336, y: 36 },
-  water: { x: 336, y: 84 },
-  cart: { x: 336, y: 138 },
-  deals: { x: 336, y: 202 },
-  summary: { x: 480, y: 126 },
-  receipt: { x: 610, y: 126 },
+  home: { x: 56, y: 122 },
+  food: { x: 178, y: 56 },
+  banking: { x: 178, y: 122 },
+  utilities: { x: 178, y: 188 },
+  biryani: { x: 322, y: 34 },
+  pasta: { x: 322, y: 82 },
+  investments: { x: 322, y: 116 },
+  balance: { x: 322, y: 160 },
+  electricity: { x: 322, y: 214 },
+  summary: { x: 482, y: 122 },
+  receipt: { x: 620, y: 122 },
+}
+const systemPrompt = 'You are Gemma inside AHEAD, a mobile speculative execution runtime. Return JSON only: {"rankedActionIds":["exact_id"]}. Use only legal IDs and rank the next likely tap.'
+
+function scenarioMemory(scenario: ScenarioId, screen: Screen) {
+  const config = scenarios[scenario]
+  const target = config.targets[screen]
+  return target ? `scenario target for this screen is ${target}; ${config.signal}` : config.signal
 }
 
-function readPattern(): UserPattern {
-  try {
-    const parsed = JSON.parse(localStorage.getItem('ahead.userPattern') || 'null')
-    if (parsed && typeof parsed === 'object' && parsed.tapCounts && Array.isArray(parsed.recentTaps)) return parsed
-  } catch { /* local memory is optional */ }
-  return emptyPattern
-}
-
-function describePattern(pattern: UserPattern) {
-  const top = Object.entries(pattern.tapCounts).sort((a, b) => b[1] - a[1]).slice(0, 4)
-  if (!top.length) return 'new user; no completed taps yet'
-  return `observed ${pattern.totalTaps} taps; habits: ${top.map(([id, count]) => `${id}=${count}`).join(', ')}`
-}
-
-function nextPattern(pattern: UserPattern, actionId: string): UserPattern {
-  return {
-    tapCounts: { ...pattern.tapCounts, [actionId]: (pattern.tapCounts[actionId] || 0) + 1 },
-    recentTaps: [actionId, ...pattern.recentTaps].slice(0, 8),
-    totalTaps: pattern.totalTaps + 1,
-  }
-}
-
-function fallbackPrediction(screen: Screen, forcedWrong: boolean, pattern: UserPattern) {
+function fallbackPrediction(screen: Screen, forcedWrong: boolean, scenario: ScenarioId) {
   const actions = graph[screen]
-  const time = new Date().getHours()
-  const contextual = time >= 11 && time <= 14 && actions.find(a => a.id.includes('food') || a.id.includes('lunch'))?.id
-  const habitual = actions.map(a => [a.id, pattern.tapCounts[a.id] || 0] as const).sort((a, b) => b[1] - a[1])[0]
-  const bill = actions.find(a => a.id.includes('electricity'))?.id
-  const preferred = habitual?.[1] ? habitual[0] : contextual || bill || actions[0].id
-  const pick = forcedWrong && actions.length > 1 ? actions.find(a => a.id !== preferred)!.id : preferred
+  const target = scenarios[scenario].targets[screen]
+  const preferred = actions.some(action => action.id === target) ? target! : actions[0].id
+  const pick = forcedWrong && actions.length > 1 ? actions.find(action => action.id !== preferred)!.id : preferred
   return actions.map(action => ({ actionId: action.id, confidence: action.id === pick ? 0.82 : +(0.18 / Math.max(actions.length - 1, 1)).toFixed(2) }))
 }
 
-function screenCopy(screen: Screen) {
-  if (screen === 'home') return { amount: '3 engines live', copy: 'Utilities, lunch, shopping, orders', accent: 'Intent router' }
-  if (screen === 'food') return { amount: '24 min', copy: 'Paneer bowl is likely at lunch time', accent: 'Food context' }
-  if (screen === 'shop' || screen === 'deals') return { amount: '42% off', copy: 'Deals and cart APIs can be warmed', accent: 'Commerce context' }
-  if (screen === 'summary') return { amount: '₹1,248', copy: 'Speculation stops before irreversible payment', accent: 'Commit-only' }
-  if (screen === 'receipt' || screen === 'orders') return { amount: 'Ready', copy: 'History and receipt state loaded', accent: 'Post-commit' }
-  return { amount: '₹1,248', copy: 'Bills, provider metadata, and review payload', accent: 'Utility context' }
+function screenHero(screen: Screen, scenario: ScenarioId, shadow: ShadowPayload | null) {
+  const imageUrl = screen === 'biryani' ? '/food/biryani.png' : screen === 'pasta' ? '/food/pasta.png' : undefined
+  if (screen === 'home') return { eyebrow: scenarios[scenario].label, value: 'Choose an app', copy: 'AHEAD predicts before the app opens.', imageUrl }
+  if (screen === 'food') return { eyebrow: 'Deep food branch', value: scenario === 'dinner' ? 'Dinner context' : 'Lunch context', copy: 'Gemma chooses Biryani at lunch and Pasta at dinner.', imageUrl }
+  if (screen === 'biryani' || screen === 'pasta') return { eyebrow: shadow?.ready ? 'Image came from shadow memory' : 'Menu loaded', value: screen === 'biryani' ? 'Hyderabadi Biryani' : 'Creamy Tomato Pasta', copy: 'The rich media asset is already decoded, so there is no pop-in.', imageUrl }
+  if (screen === 'banking') return { eyebrow: 'Banking branch', value: scenario === 'payday' ? 'Payday signal' : 'Month-end signal', copy: 'Gemma switches between Investments and Balance from date context.', imageUrl }
+  if (screen === 'investments') return { eyebrow: 'Payday prediction', value: 'Portfolio +2.8%', copy: 'Investment dashboard was safely prefetched.', imageUrl }
+  if (screen === 'balance') return { eyebrow: 'Month-end prediction', value: 'Balance Rs 82,440', copy: 'Balance view was safely prefetched without side effects.', imageUrl }
+  if (screen === 'utilities') return { eyebrow: 'Bill due signal', value: 'Due today', copy: 'The 14th points Gemma to Electricity.', imageUrl }
+  if (screen === 'summary') return { eyebrow: 'Safety boundary', value: 'Human tap required', copy: 'AHEAD can prepare checkout but cannot cross the commit boundary.', imageUrl }
+  if (screen === 'receipt') return { eyebrow: 'Committed', value: 'Done', copy: 'Side effects happen only after explicit user action.', imageUrl }
+  return { eyebrow: 'Shadow safe', value: title[screen], copy: 'Prefetched data is isolated until the branch is chosen.', imageUrl }
 }
 
 export default function App() {
+  const [scenario, setScenario] = useState<ScenarioId>('lunch')
   const [screen, setScreen] = useState<Screen>('home')
-  const [ahead, setAhead] = useState(true)
   const [network, setNetwork] = useState<Network>('terrible')
+  const [ahead, setAhead] = useState(true)
   const [forceWrong, setForceWrong] = useState(false)
-  const [branch, setBranch] = useState<{ id: string; actionId: string; state: 'idle' | 'speculating' | 'committed' | 'rolledback' }>({ id: 'B-000', actionId: 'none', state: 'idle' })
+  const [branch, setBranch] = useState<{ id: string; actionId: string; state: BranchState }>({ id: 'B-000', actionId: 'none', state: 'idle' })
+  const [prediction, setPrediction] = useState<Ranked[]>(() => fallbackPrediction('home', false, 'lunch'))
+  const [predictor, setPredictor] = useState({ source: 'connecting', model: 'Detecting Ollama...', latencyMs: 0 })
+  const [shadow, setShadow] = useState<ShadowPayload | null>(null)
   const [events, setEvents] = useState<Telemetry[]>([])
   const [saved, setSaved] = useState(0)
   const [hits, setHits] = useState(0)
   const [misses, setMisses] = useState(0)
   const [loading, setLoading] = useState(false)
-  const [prediction, setPrediction] = useState<Ranked[]>(() => fallbackPrediction('home', false, emptyPattern))
-  const [predictor, setPredictor] = useState({ source: 'connecting', model: 'Detecting Ollama...', latencyMs: 0 })
-  const [pattern, setPattern] = useState<UserPattern>(() => readPattern())
-  const [shadow, setShadow] = useState<ShadowPayload | null>(null)
-  const [inspector, setInspector] = useState<Inspector>({ systemPrompt, userPrompt: 'Waiting for first prediction...', context: {}, raw: 'pending' })
   const [race, setRace] = useState({ normalMs: latency.terrible, shadowMs: 0, status: 'standby' })
-  const timer = useRef<number | undefined>(undefined)
+  const [inspector, setInspector] = useState<Inspector>({ systemPrompt, userPrompt: 'Waiting for prediction...', context: {}, raw: 'pending' })
+  const timer = useRef<ReturnType<typeof window.setTimeout> | undefined>(undefined)
   const branchId = useRef(0)
   const speculativeRequest = useRef<AbortController | null>(null)
 
-  const log = (type: EventType, detail: string) => setEvents(prev => [{ type, detail, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }, ...prev].slice(0, 8))
+  const actions = graph[screen]
   const predictedId = prediction[0]?.actionId
-  const actionCards = graph[screen]
-  const currentCopy = screenCopy(screen)
-  const predictedAction = actionCards.find(action => action.id === predictedId)
+  const predictedAction = actions.find(action => action.id === predictedId)
   const score = hits + misses ? Math.round((hits / (hits + misses)) * 100) : 100
+  const hero = screenHero(screen, scenario, shadow)
+
+  const log = (type: EventType, detail: string) => setEvents(previous => [{ type, detail, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }, ...previous].slice(0, 8))
 
   useEffect(() => {
     window.clearTimeout(timer.current)
     speculativeRequest.current?.abort()
     let cancelled = false
     const run = async () => {
+      const config = scenarios[scenario]
       const context = {
+        scenario,
+        scenarioLabel: config.label,
+        scenarioSignal: config.signal,
+        scenarioTarget: config.targets[screen] || 'none',
         screenId: screen,
-        legalActionIds: graph[screen].map(action => action.id),
-        legalActionHints: graph[screen].map(action => `${action.id}=${action.label}; ${action.subtitle || 'no hint'}`),
-        hourOfDay: new Date().getHours(),
-        dayOfMonth: 2,
-        historySummary: describePattern(pattern),
-        recentTaps: pattern.recentTaps,
+        legalActionIds: actions.map(action => action.id),
+        legalActionHints: actions.map(action => `${action.id}=${action.label}; ${action.subtitle}`),
+        hourOfDay: config.hour,
+        dayOfMonth: config.day,
+        historySummary: scenarioMemory(scenario, screen),
+        recentTaps: [screen, scenario],
         networkRttMs: latency[network],
       }
-      const userPrompt = `Screen=${context.screenId}; legal=${context.legalActionIds.join(',')}; hour=${context.hourOfDay}; day=${context.dayOfMonth}; history=${context.historySummary}; recent=${context.recentTaps.join(',') || 'none'}; rtt=${context.networkRttMs}ms. Rank likely next tap.`
-      let ranked = fallbackPrediction(screen, forceWrong, pattern)
+      const userPrompt = `Scenario=${context.scenarioLabel}; signal=${context.scenarioSignal}; screen=${screen}; legal=${context.legalActionHints.join(' | ')}; hour=${context.hourOfDay}; day=${context.dayOfMonth}; target_hint=${context.scenarioTarget}; network=${context.networkRttMs}ms. Rank the next tap.`
+      let ranked = fallbackPrediction(screen, forceWrong, scenario)
       let source = 'heuristic'; let model = 'local heuristic'; let latencyMs = 0
       let raw = JSON.stringify({ rankedActionIds: ranked.map(item => item.actionId) })
       let fallbackReason: string | undefined
@@ -183,164 +172,108 @@ export default function App() {
         const result = await response.json() as { ranked: Ranked[]; source: string; model?: string; latencyMs: number; raw?: string; fallbackReason?: string }
         ranked = [...result.ranked].sort((a, b) => b.confidence - a.confidence)
         source = result.source; model = result.model ?? 'local heuristic'; latencyMs = result.latencyMs; raw = result.raw ?? raw; fallbackReason = result.fallbackReason
-        if (forceWrong && ranked.length > 1) {
-          const firstId = ranked[0].actionId
-          ranked[0] = { ...ranked[0], actionId: ranked[1].actionId }
-          ranked[1] = { ...ranked[1], actionId: firstId }
-        }
+        if (forceWrong && ranked.length > 1) ranked = [ranked[1], ranked[0], ...ranked.slice(2)]
       } catch {
         fallbackReason = 'frontend_timeout_or_api_unavailable'
       }
       if (cancelled) return
       setPrediction(ranked); setPredictor({ source, model, latencyMs }); setInspector({ systemPrompt, userPrompt, context, raw, fallbackReason })
-      if (!ahead) return
       const chosen = ranked[0]
       const action = graph[screen].find(item => item.id === chosen.actionId)
-      if (!action?.speculatable || chosen.confidence < .5 || network === 'good') return
+      if (!ahead || !action?.speculatable || chosen.confidence < .5 || network === 'good') return
       const id = `B-${String(++branchId.current).padStart(3, '0')}`
+      const path = action.apiPath || '/api/apps/home'
+      const controller = new AbortController()
+      speculativeRequest.current = controller
       setBranch({ id, actionId: chosen.actionId, state: 'speculating' })
-      setShadow({ branchId: id, actionId: chosen.actionId, path: action.apiPath || '/api/noop', ready: false, payload: { status: 'fetching' }, latencyMs: 0 })
+      setShadow({ branchId: id, actionId: chosen.actionId, path, ready: false, payload: { status: 'fetching' }, latencyMs: 0 })
       log('prediction_made', `${model} ranked ${chosen.actionId} at ${Math.round(chosen.confidence * 100)}%`)
-      log('speculation_started', `${id} forked shadow memory for ${action.apiPath}`)
-      const controller = new AbortController(); speculativeRequest.current = controller
+      log('speculation_started', `${id} started JSON + media preload for ${path}`)
       const started = performance.now()
-      fetch(`${action.apiPath || '/api/noop'}?network=${network}`, { signal: controller.signal })
+      fetch(`${path}?network=${network}`, { signal: controller.signal })
         .then(response => response.json())
-        .then(payload => {
+        .then((payload: Record<string, unknown>) => {
           if (cancelled) return
           const took = Math.round(performance.now() - started)
-          setShadow({ branchId: id, actionId: chosen.actionId, path: action.apiPath || '/api/noop', ready: true, payload, latencyMs: took })
+          const imageUrl = typeof payload.imageUrl === 'string' ? payload.imageUrl : undefined
+          if (imageUrl) {
+            const image = new Image()
+            image.src = imageUrl
+            log('image_preloaded', `${id} decoded ${imageUrl}`)
+          }
+          setShadow({ branchId: id, actionId: chosen.actionId, path, ready: true, payload, latencyMs: took, imageUrl })
           log('shadow_hydrated', `${id} payload ready in ${took}ms`)
         })
         .catch(() => undefined)
     }
     run()
     return () => { cancelled = true; speculativeRequest.current?.abort(); window.clearTimeout(timer.current) }
-  }, [screen, ahead, network, forceWrong, pattern])
+  }, [screen, scenario, network, ahead, forceWrong])
+
+  const chooseScenario = (next: ScenarioId) => {
+    setScenario(next)
+    setScreen('home')
+    setShadow(null)
+    setBranch({ id: 'B-000', actionId: 'none', state: 'idle' })
+    setRace({ normalMs: latency[network], shadowMs: 0, status: 'scenario_reset' })
+  }
 
   const navigate = (action: Action) => {
-    const updatedPattern = nextPattern(pattern, action.id)
-    localStorage.setItem('ahead.userPattern', JSON.stringify(updatedPattern))
-    setPattern(updatedPattern)
     if (!action.speculatable) {
-      log('boundary_blocked', 'COMMIT_ONLY: payment requires a fresh human tap')
-      setBranch(b => ({ ...b, state: 'idle' }))
+      log('boundary_blocked', 'COMMIT_ONLY: irreversible payment/transfer needs a human tap')
       setLoading(true)
       fetch('/api/pay', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ actionId: action.id, humanConfirmed: true }) })
-        .finally(() => { timer.current = window.setTimeout(() => { setLoading(false); setScreen(action.screen) }, 520) })
+        .finally(() => { timer.current = window.setTimeout(() => { setLoading(false); setScreen(action.screen) }, 420) })
       return
     }
     const hit = ahead && action.id === predictedId && branch.state === 'speculating' && shadow?.ready
     if (hit) {
-      setRace({ normalMs: latency[network], shadowMs: 16, status: 'shadow_commit_won' })
-      setBranch(b => ({ ...b, state: 'committed' }))
+      setRace({ normalMs: latency[network], shadowMs: shadow.imageUrl ? 12 : 18, status: shadow.imageUrl ? 'image_shadow_commit_won' : 'shadow_commit_won' })
+      setBranch(current => ({ ...current, state: 'committed' }))
       setHits(value => value + 1)
       setSaved(value => value + latency[network])
-      log('branch_committed', `${branch.id} promoted from shadow memory; ${latency[network]}ms avoided`)
+      log('branch_committed', `${branch.id} promoted instantly; ${latency[network]}ms avoided`)
       setScreen(action.screen)
       return
     }
     if (ahead) {
-      setBranch(b => ({ ...b, state: 'rolledback' }))
+      setBranch(current => ({ ...current, state: 'rolledback' }))
       setMisses(value => value + 1)
-      log('branch_rolled_back', `${branch.id} discarded; wrong branch caused zero side effects`)
+      log('branch_rolled_back', `${branch.id} discarded safely; no side effects crossed`)
     }
     setRace({ normalMs: latency[network], shadowMs: 0, status: 'normal_network_wait' })
     setLoading(true)
     timer.current = window.setTimeout(() => { setLoading(false); setScreen(action.screen) }, latency[network])
   }
 
-  const edges = useMemo(() => Object.entries(graph).flatMap(([from, actions]) => actions.map(action => ({ from: from as Screen, to: action.screen, id: action.id }))).filter(edge => nodePos[edge.from] && nodePos[edge.to]), [])
+  const edges = useMemo(() => Object.entries(graph).flatMap(([from, items]) => items.map(item => ({ from: from as Screen, to: item.screen, id: item.id }))).filter(edge => nodePos[edge.from] && nodePos[edge.to]), [])
 
   return <main>
-    <header>
-      <div className="brand"><span>A</span><div>AHEAD <em>GEMMA SPECULATIVE ENGINE</em></div></div>
-      <div className="offline">LOCAL GEMMA 4 · SHADOW STATE · ZERO SIDE EFFECTS</div>
-    </header>
-
+    <header><div className="brand"><span>A</span><div>AHEAD <em>V3 GEMMA SPECULATIVE ENGINE</em></div></div><div className="offline">IOS HOME · DEEP BRANCHES · IMAGE PRELOAD</div></header>
     <section className="layout">
       <article className="phone">
-        <div className="notch" />
-        <div className="phone-top"><small>9:41</small><b>● ● ●</b></div>
-        <div className="app-head"><span className="avatar">P</span><div><small>AHEAD SUPER APP</small><h2>{title[screen]}</h2></div><span className="scan">⌁</span></div>
-        {loading ? <div className="spinner"><i /> Normal request waiting on {network} network...</div> : <div className="phone-content">
-          <div className="hero-card">
-            <small>{currentCopy.accent}</small>
-            <strong>{currentCopy.amount}</strong>
-            <p>{currentCopy.copy}</p>
-          </div>
-          <p className="section-label">NEXT ACTIONS</p>
-          {actionCards.map(action => <button className={action.id === predictedId && branch.state === 'speculating' ? 'service preloaded' : 'service'} key={action.id} onClick={() => navigate(action)}>
-            <span className="service-icon">{action.icon}</span>
-            <span>{action.label}<small>{action.subtitle || 'Speculatable route'}</small></span>
-            {action.id === predictedId && branch.state === 'speculating' && <em>{shadow?.ready ? 'PRELOADED' : 'STAGING'}</em>}
-            <b>›</b>
-          </button>)}
-          {screen === 'summary' && <p className="boundary">Human confirmation boundary: AHEAD can prepare checkout, but cannot pay.</p>}
+        <div className="notch" /><div className="phone-top"><small>9:41</small><b>● ● ●</b></div>
+        <div className="app-head"><span className="avatar">P</span><div><small>{scenarios[scenario].label}</small><h2>{title[screen]}</h2></div><span className="scan">⌁</span></div>
+        {loading ? <div className="phone-content"><div className="skeleton-screen"><i /><b /><b /><b /><span /></div></div> : <div className="phone-content scroll">
+          <div className={hero.imageUrl ? 'hero-card media' : 'hero-card'}>{hero.imageUrl && <img src={hero.imageUrl} alt="" />}<small>{hero.eyebrow}</small><strong>{hero.value}</strong><p>{hero.copy}</p></div>
+          {screen === 'home' ? <div className="ios-grid">{actions.map(action => <button className={action.id === predictedId && branch.state === 'speculating' ? 'app-icon preloaded' : 'app-icon'} key={action.id} onClick={() => navigate(action)} style={{ '--tint': action.appTint } as CSSProperties}><span>{action.icon}</span><b>{action.label}</b>{action.id === predictedId && branch.state === 'speculating' && <em>{shadow?.ready ? 'PRELOADED' : 'STAGING'}</em>}</button>)}</div> : <>
+            <p className="section-label">NEXT INSIDE {title[screen].toUpperCase()}</p>
+            {actions.map(action => <button className={action.id === predictedId && branch.state === 'speculating' ? 'service preloaded' : 'service'} key={action.id} onClick={() => navigate(action)}><span className="service-icon">{action.icon}</span><span>{action.label}<small>{action.subtitle}</small></span>{action.id === predictedId && branch.state === 'speculating' && <em>{shadow?.ready ? 'PRELOADED' : 'STAGING'}</em>}<b>›</b></button>)}
+          </>}
+          {screen === 'summary' && <p className="boundary">AHEAD can preload the review screen, but payment and transfer confirmation are commit-only.</p>}
         </div>}
         <nav><span>⌂<small>Home</small></span><span>⌁<small>X-Ray</small></span><span>◉<small>Profile</small></span></nav>
       </article>
 
       <aside className="dash">
-        <div className="eyebrow">X-RAY ENGINE ROOM</div>
-        <div className="headline"><h1>Speculation made visible <span>{(saved / 1000).toFixed(1)}s saved</span></h1><p>Gemma predicts the next legal tap, AHEAD hydrates shadow memory, then commits instantly only when the user actually chooses that branch.</p></div>
-
-        <div className="grid stats">
-          <div><small>PREDICTOR</small><b>{predictor.source === 'gemma4' ? 'Gemma 4' : predictor.source === 'gemma3' ? 'Gemma 3' : 'Heuristic'}</b><em>{predictor.model} · {predictor.latencyMs}ms</em></div>
-          <div><small>NETWORK</small><b>{latency[network]}ms</b><em className={network}>● {network.toUpperCase()}</em></div>
-          <div><small>ACCURACY</small><b>{score}%</b><em>{hits} commits · {misses} rollbacks</em></div>
-        </div>
-
-        <section className="panel graph-panel">
-          <div className="panel-title"><span>DECISION GRAPH</span><small>{branch.state.toUpperCase()} · {branch.id}</small></div>
-          <svg viewBox="0 0 680 250" role="img">
-            {edges.map(edge => {
-              const from = nodePos[edge.from]!
-              const to = nodePos[edge.to]!
-              const active = edge.id === predictedId
-              return <line key={`${edge.from}-${edge.id}`} x1={from.x} y1={from.y} x2={to.x} y2={to.y} className={active ? 'edge active' : 'edge'} />
-            })}
-            {Object.entries(nodePos).map(([id, pos]) => <g key={id} className={screen === id ? 'node current' : id === predictedAction?.screen ? 'node predicted' : 'node'}>
-              <circle cx={pos.x} cy={pos.y} r="14" />
-              <text x={pos.x} y={pos.y + 31}>{id}</text>
-            </g>)}
-          </svg>
-        </section>
-
-        <div className="split">
-          <section className="panel">
-            <div className="panel-title"><span>GEMMA RANKING</span><small>{screen.toUpperCase()}</small></div>
-            {prediction.map(item => <div className="prediction" key={item.actionId}><div><b>{actionCards.find(a => a.id === item.actionId)?.label || item.actionId}</b><span>{Math.round(item.confidence * 100)}%</span></div><i><u style={{ width: `${item.confidence * 100}%` }} /></i></div>)}
-          </section>
-          <section className="panel race">
-            <div className="panel-title"><span>LATENCY RACE</span><small>{race.status}</small></div>
-            <div><span>Normal request</span><i><u style={{ width: `${Math.min(100, latency[network] / 50)}%` }} /></i><b>{race.normalMs}ms</b></div>
-            <div><span>Shadow commit</span><i><u className="fast" style={{ width: `${race.status === 'shadow_commit_won' ? 8 : 0}%` }} /></i><b>{race.status === 'shadow_commit_won' ? `${race.shadowMs}ms` : 'ready'}</b></div>
-          </section>
-        </div>
-
-        <div className="split">
-          <section className="panel json-panel">
-            <div className="panel-title"><span>SHADOW MEMORY</span><small>{shadow?.ready ? 'HYDRATED' : 'WAITING'}</small></div>
-            <pre>{JSON.stringify(shadow || { branchId: branch.id, state: 'no shadow branch yet' }, null, 2)}</pre>
-          </section>
-          <section className="panel json-panel">
-            <div className="panel-title"><span>OLLAMA PIPELINE</span><small>{predictor.source}</small></div>
-            <pre>{JSON.stringify({ system: inspector.systemPrompt, user: inspector.userPrompt, raw: inspector.raw, fallbackReason: inspector.fallbackReason }, null, 2)}</pre>
-          </section>
-        </div>
-
-        <section className="panel events">
-          <div className="panel-title"><span>EVENT STREAM</span><small>{describePattern(pattern)}</small></div>
-          {events.length ? events.map((event, index) => <p key={`${event.time}-${index}`}><time>{event.time}</time><b>{event.type}</b>{event.detail}</p>) : <p>Runtime standing by...</p>}
-        </section>
-
-        <section className="controls">
-          <label><input type="checkbox" checked={ahead} onChange={event => setAhead(event.target.checked)} /><span>AHEAD {ahead ? 'ON' : 'OFF'}</span></label>
-          <select value={network} onChange={event => setNetwork(event.target.value as Network)}><option value="good">Good · 250ms</option><option value="congested">Congested · 2.5s</option><option value="terrible">Terrible · 5s</option></select>
-          <button onClick={() => setForceWrong(value => !value)} className={forceWrong ? 'wrong active' : 'wrong'}>Force wrong branch</button>
-          <button onClick={() => { localStorage.removeItem('ahead.userPattern'); setPattern(emptyPattern) }}>Reset memory</button>
-        </section>
+        <div className="eyebrow">V3 X-RAY ENGINE ROOM</div>
+        <div className="headline"><h1>Deep intent prediction <span>{(saved / 1000).toFixed(1)}s saved</span></h1><p>Gemma predicts app launch, then predicts inside the app. AHEAD preloads JSON and rich media into shadow memory before the user taps.</p></div>
+        <div className="grid stats"><div><small>PREDICTOR</small><b>{predictor.source === 'gemma4' ? 'Gemma 4' : predictor.source === 'gemma3' ? 'Gemma 3' : 'Heuristic'}</b><em>{predictor.model} · {predictor.latencyMs}ms</em></div><div><small>NETWORK</small><b>{latency[network]}ms</b><em className={network}>● {network.toUpperCase()}</em></div><div><small>ACCURACY</small><b>{score}%</b><em>{hits} commits · {misses} rollbacks</em></div></div>
+        <section className="panel graph-panel"><div className="panel-title"><span>DECISION GRAPH</span><small>{branch.state.toUpperCase()} · {branch.id}</small></div><svg viewBox="0 0 680 250">{edges.map(edge => { const from = nodePos[edge.from]!; const to = nodePos[edge.to]!; return <line key={`${edge.from}-${edge.id}`} x1={from.x} y1={from.y} x2={to.x} y2={to.y} className={edge.id === predictedId ? 'edge active' : 'edge'} /> })}{Object.entries(nodePos).map(([id, pos]) => <g key={id} className={screen === id ? 'node current' : predictedAction?.screen === id ? 'node predicted' : 'node'}><circle cx={pos.x} cy={pos.y} r="14" /><text x={pos.x} y={pos.y + 31}>{id}</text></g>)}</svg></section>
+        <div className="split"><section className="panel"><div className="panel-title"><span>GEMMA RANKING</span><small>{screen.toUpperCase()}</small></div>{prediction.map(item => <div className="prediction" key={item.actionId}><div><b>{actions.find(action => action.id === item.actionId)?.label || item.actionId}</b><span>{Math.round(item.confidence * 100)}%</span></div><i><u style={{ width: `${item.confidence * 100}%` }} /></i></div>)}</section><section className="panel race"><div className="panel-title"><span>LATENCY RACE</span><small>{race.status}</small></div><div><span>Normal request</span><i><u style={{ width: `${Math.min(100, latency[network] / 30)}%` }} /></i><b>{race.normalMs}ms</b></div><div><span>Shadow commit</span><i><u className="fast" style={{ width: `${race.status.includes('won') ? 8 : 0}%` }} /></i><b>{race.status.includes('won') ? `${race.shadowMs}ms` : 'ready'}</b></div></section></div>
+        <div className="split"><section className="panel json-panel"><div className="panel-title"><span>SHADOW MEMORY</span><small>{shadow?.imageUrl ? 'IMAGE + JSON' : shadow?.ready ? 'JSON' : 'WAITING'}</small></div><pre>{JSON.stringify(shadow || { state: 'no shadow branch yet' }, null, 2)}</pre></section><section className="panel json-panel"><div className="panel-title"><span>OLLAMA PIPELINE</span><small>{scenario}</small></div><pre>{JSON.stringify({ user: inspector.userPrompt, raw: inspector.raw, fallbackReason: inspector.fallbackReason }, null, 2)}</pre></section></div>
+        <section className="panel events"><div className="panel-title"><span>EVENT STREAM</span><small>{scenarios[scenario].signal}</small></div>{events.length ? events.map((event, index) => <p key={`${event.time}-${index}`}><time>{event.time}</time><b>{event.type}</b>{event.detail}</p>) : <p>Runtime standing by...</p>}</section>
+        <section className="controls"><label><input type="checkbox" checked={ahead} onChange={event => setAhead(event.target.checked)} /><span>AHEAD {ahead ? 'ON' : 'OFF'}</span></label><select value={scenario} onChange={event => chooseScenario(event.target.value as ScenarioId)}>{Object.entries(scenarios).map(([id, item]) => <option key={id} value={id}>{item.label}</option>)}</select><select value={network} onChange={event => setNetwork(event.target.value as Network)}><option value="good">Good · 250ms</option><option value="congested">Congested · 1.4s</option><option value="terrible">Terrible · 3s</option></select><button onClick={() => setForceWrong(value => !value)} className={forceWrong ? 'wrong active' : 'wrong'}>Force wrong branch</button></section>
       </aside>
     </section>
   </main>
